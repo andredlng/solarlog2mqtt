@@ -102,6 +102,10 @@ For service management, use [systemd](https://systemd.io/) or your preferred sup
 I have not the time (yet) to provide professional support for this project.
 But feel free to submit issues and PRs, I'll check for it and honor your contributions.
 
+## Acknowledgments
+
+- Inspired by Gerrit's ([c0d3.sh](https://c0d3.sh/smarthome)|[GitHub](https://github.com/gbeine)) smarthome repositories
+
 ## License
 
 The whole project is licensed under BSD-3-Clause license. Stay fair.

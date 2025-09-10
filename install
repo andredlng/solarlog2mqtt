@@ -1,0 +1,14 @@
+#!/bin/sh
+#
+# Installation script for solarlog2mqtt and its dependencies
+#
+# (c) André Deuerling, 2025
+#
+
+python3 -m venv venv
+
+. venv/bin/activate
+
+pip install --upgrade pip
+pip install -r requirements.txt
+

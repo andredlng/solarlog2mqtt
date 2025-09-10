@@ -1,0 +1,11 @@
+[Unit]
+Description=solarlog2mqtt bridge daemon
+Documentation=https://c0d3.sh/andre/solarlog2mqtt
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/solarlog2mqtt
+
+[Install]
+WantedBy=multi-user.target
+Alias=solarlog2mqtt.service

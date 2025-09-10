@@ -1,0 +1,23 @@
+{
+    "mqtt_host": "localhost",
+    "mqtt_port": "1883",
+    "mqtt_keepalive": "300",
+    "mqtt_clientid": "solarlog2mqtt",
+    "mqtt_user": "solarlog",
+    "mqtt_password": "t0p_s3cr3t",
+    "mqtt_topic": "solarlog",
+    "mqtt_tls": "false",
+    "mqtt_tls_version": "TLSv1.2",
+    "mqtt_verify_mode": "CERT_NONE",
+    "mqtt_ssl_ca_path": "/etc/ssl/myca.pem",
+    "mqtt_tls_no_verify": "false",
+    "solarlog_host": "192.168.1.100",
+    "solarlog_port": "80",
+    "solarlog_user": "user",
+    "solarlog_password": "password123",
+    "poll_interval_periodic": "300",
+    "poll_interval_current": "30",
+    "historic_data": "true",
+    "timestamp": "false",
+    "verbose": "false"
+}

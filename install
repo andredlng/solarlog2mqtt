@@ -5,10 +5,11 @@
 # (c) André Deuerling, 2025
 #
 
-python3 -m venv venv
+uv venv venv
 
 . venv/bin/activate
 
-pip install --upgrade pip
-pip install -r requirements.txt
+if ! uv pip install --editable .; then
+    echo "Editable install skipped (setuptools unavailable); run script uses src/ layout."
+fi
 

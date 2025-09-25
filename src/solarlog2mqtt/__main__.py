@@ -11,9 +11,9 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Union
 
 import paho.mqtt.client as mqtt
-from solarlog2mqtt_core.solar_log_client import SolarLogClient
-from solarlog2mqtt_core.logging_config import configure_logging
-from solarlog2mqtt_core.constants import (
+from .core.solar_log_client import SolarLogClient
+from .core.logging_config import configure_logging
+from .core.constants import (
     MAX_REQUEST_FAILURES,
     MAX_LOGIN_FAILURES,
     DEFAULT_RESTART_DELAY,
@@ -25,7 +25,7 @@ from solarlog2mqtt_core.constants import (
     FAST_POLL_DATA,
     HISTORIC_DATA,
 )
-from solarlog2mqtt_core.config_schema import validate_config
+from .core.config_schema import validate_config
 
 
 mqtt_client = None
@@ -37,9 +37,9 @@ running = True
 # Header helpers moved to solar_log_client.SolarLogClient
 
 
-from solarlog2mqtt_core.mqtt_publisher import MQTTPublisher
-from solarlog2mqtt_core.data_processor import DataProcessor
-from solarlog2mqtt_core.orchestrator import (
+from .core.mqtt_publisher import MQTTPublisher
+from .core.data_processor import DataProcessor
+from .core.orchestrator import (
     get_forecast_data as orchestrator_get_forecast_data,
     health_check as orchestrator_health_check,
 )
@@ -578,7 +578,7 @@ async def forecast_polling_loop():
             await asyncio.sleep(3600)  # Wait 1 hour on error
 
 
-# Forecast helpers moved to solarlog2mqtt_core.orchestrator
+# Forecast helpers moved to solarlog2mqtt.core.orchestrator
 
 
 def parse_args():

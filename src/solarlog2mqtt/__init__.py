@@ -1,0 +1,1 @@
+"""solarlog2mqtt package."""

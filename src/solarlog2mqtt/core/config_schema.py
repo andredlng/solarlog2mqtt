@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 import logging
 
-from solarlog2mqtt_core.exceptions import ConfigError, ValidationError
+from .exceptions import ConfigError, ValidationError
 
 
 ALLOWED_TLS: set[str] = {"TLSv1", "TLSv1.1", "TLSv1.2"}

@@ -19,9 +19,11 @@ cd solarlog2mqtt
 ./install
 ```
 
-The `install` script creates a virtual python environment using the `venv` module.
-All required libraries are installed automatically.
-Depending on your system this may take some time.
+The `install` script uses [uv](https://github.com/astral-sh/uv) to provision a local virtual environment
+and install the dependencies declared in `pyproject.toml`.
+It attempts an editable install so the `solarlog2mqtt` console command works immediately;
+if build dependencies are unavailable (e.g., offline installs), the run script still loads the package
+directly from `src/`.
 
 ## Configuration
 
@@ -92,7 +94,9 @@ Use the provided run script or invoke via the venv:
 ```bash
 ./run -c solarlog2mqtt.conf
 # or
-./venv/bin/python solarlog2mqtt -c solarlog2mqtt.conf --log-level INFO
+./venv/bin/python -m solarlog2mqtt -c solarlog2mqtt.conf --log-level INFO
+# or
+./venv/bin/solarlog2mqtt -c solarlog2mqtt.conf --log-level INFO
 ```
 
 For service management, use [systemd](https://systemd.io/) or your preferred supervisor.

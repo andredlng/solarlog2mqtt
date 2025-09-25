@@ -12,7 +12,7 @@ import time
 import logging
 import asyncio
 import aiohttp
-from solarlog2mqtt_core.constants import (
+from .constants import (
     HTTP_TIMEOUT_SECONDS,
     MAX_REQUEST_FAILURES,
     MAX_LOGIN_FAILURES,

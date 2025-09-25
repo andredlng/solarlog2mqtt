@@ -9,7 +9,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Callable, Protocol
 
-from solarlog2mqtt_core.constants import HTTP_TIMEOUT_SECONDS
+from .constants import HTTP_TIMEOUT_SECONDS
 
 
 class PublishFn(Protocol):

@@ -10,8 +10,8 @@ from typing import Any, TYPE_CHECKING
 import logging
 import math
 from datetime import datetime, timedelta
-from solarlog2mqtt_core.api_validation import as_dict
-from solarlog2mqtt_core.constants import (
+from .api_validation import as_dict
+from .constants import (
     MAX_SWITCH_GROUPS,
     DEFAULT_SETPOINT_DAILY_DIVISOR,
     DEVICE_CLASS_LIST,
@@ -19,7 +19,7 @@ from solarlog2mqtt_core.constants import (
 )
 
 if TYPE_CHECKING:  # Avoid runtime import cycle during initial skeleton stage
-    from solarlog2mqtt_core.mqtt_publisher import MQTTPublisher
+    from .mqtt_publisher import MQTTPublisher
 
 
 class DataProcessor:

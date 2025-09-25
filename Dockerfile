@@ -1,13 +1,12 @@
-FROM python:3.12-alpine
+FROM astral/uv:python3.12-alpine
 
 WORKDIR /app
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml README.md LICENSE.md ./
+COPY src ./src
 
-COPY solarlog2mqtt ./
-COPY solarlog2mqtt_core ./solarlog2mqtt_core
+RUN uv pip install --system --editable .
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python", "./solarlog2mqtt"]
+CMD ["solarlog2mqtt"]

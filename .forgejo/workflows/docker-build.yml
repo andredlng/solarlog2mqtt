@@ -37,7 +37,7 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: c0d3.sh/smarthome/solarlog2mqtt:latest
+          tags: c0d3.sh/andre/solarlog2mqtt:latest
           secrets: |
             GIT_AUTH_TOKEN=${{ secrets.C0D3SH_TOKEN }}
 

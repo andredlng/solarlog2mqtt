@@ -11,9 +11,9 @@ jobs:
       env:
         DOCKER_HOST: ${{ vars.DOCKER_HOST }}
     steps:
-      - name: Install docker & dependencies
+      - name: Install docker
         run: |
-          apk add --no-cache docker catatonit
+          apk add --no-cache docker
 
       - name: Checkout
         uses: actions/checkout@v4

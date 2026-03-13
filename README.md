@@ -65,8 +65,6 @@ Each configuration option is also available as command line argument.
 | `forecast_azimuth`       | 180                  | `--forecast_azimuth`       | Panel azimuth in degrees (180=south).                                                  |
 | `timestamp`              | -                    | `-z`, `--timestamp`        | Publish timestamps for all topics, e.g. for monitoring purposes.                       |
 | `verbose`                | -                    | `-v`, `--verbose`          | Be verbose while running (forces DEBUG).                                               |
-| `log_level`              | INFO                 | `--log-level`              | Logging level: CRITICAL, ERROR, WARNING, INFO, DEBUG, NOTSET.                          |
-| `log_format`             | text                 | `--log-format`             | Logging format: text or json.                                                          |
 | -                        | '/etc/solarlog2mqtt.conf' | `-c`, `--config`      | The path to the config file.                                                           |
 
 ### Solar Log
@@ -94,9 +92,9 @@ Use the provided run script or invoke via the venv:
 ```bash
 ./run -c solarlog2mqtt.conf
 # or
-./venv/bin/python -m solarlog2mqtt -c solarlog2mqtt.conf --log-level INFO
+./venv/bin/python -m solarlog2mqtt -c solarlog2mqtt.conf
 # or
-./venv/bin/solarlog2mqtt -c solarlog2mqtt.conf --log-level INFO
+./venv/bin/solarlog2mqtt -c solarlog2mqtt.conf
 ```
 
 For service management, use [systemd](https://systemd.io/) or your preferred supervisor.

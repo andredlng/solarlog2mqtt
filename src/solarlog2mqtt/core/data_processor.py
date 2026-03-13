@@ -82,16 +82,12 @@ class DataProcessor:
             return
         try:
             full_topic = f"{self.base_topic}/{topic}"
-            logging.debug(
-                "Publishing to MQTT - Topic: %s, Value: %s", full_topic, value
-            )
             iot_daemonize.mqtt_client.publish(full_topic, str(value))
         except Exception:
             logging.exception("MQTT publish error")
 
     async def process_response(self, req_data: str, data: Any) -> None:
         """Unified dispatcher for all Solar-Log response types."""
-        logging.debug("Processing data for request: %s...", req_data[:10])
         match classify_request(req_data):
             case RequestType.MONTHS_JSON:
                 await self.historic.process_months_json(data)
@@ -162,8 +158,6 @@ class DataProcessor:
     async def process_startup_data(self, data: dict[str, Any]) -> None:
         """Process startup data and extract device information."""
         try:
-            logging.debug("Startup data keys: %s", list(data.keys()))
-
             await self._process_device_system_info(data)
             await self._process_sd_card_info(data)
             await self.devices.process_device_discovery(data)
@@ -179,10 +173,6 @@ class DataProcessor:
                     )
                 except Exception as exc:
                     logging.warning("Error processing setpoint data: %s", exc)
-            else:
-                logging.debug(
-                    "Setpoint data (152/161/162) not available in startup data"
-                )
 
         except Exception:
             logging.exception("Startup data processing error")
@@ -194,11 +184,6 @@ class DataProcessor:
             types = self.devices.device_types
             brands = self.devices.device_brands
             classes = self.devices.device_classes
-            logging.debug("Publishing device info for %s devices", len(inv_names))
-            logging.debug("Device names: %s", inv_names)
-            logging.debug("Device types: %s", types)
-            logging.debug("Device brands: %s", brands)
-            logging.debug("Device classes: %s", classes)
 
             for i, name in enumerate(inv_names):
                 if i < len(classes):
@@ -208,7 +193,6 @@ class DataProcessor:
                 if i < len(brands):
                     self.publish(f"INV/{name}/devicebrand", brands[i])
 
-            logging.info("Published device info for %s devices", len(inv_names))
         except Exception:
             logging.exception("Failed to publish device info")
 
@@ -263,7 +247,7 @@ class DataProcessor:
             power = data_161 if data_161 else 0
             setpoint_year = efficiency * (power / 1000)
 
-            logging.info(
+            logging.debug(
                 "Calculated yearly setpoint: %s (efficiency: %s, power: %s)",
                 setpoint_year,
                 efficiency,
@@ -309,9 +293,6 @@ class DataProcessor:
         if "608" in data and "782" in data and inv_names:
             status_data = data["608"]
             pac_data = data["782"]
-            logging.debug("Inverter names: %s", inv_names)
-            logging.debug("Status data: %s", status_data)
-            logging.debug("PAC data: %s", pac_data)
 
             for idx in range(len(inv_names)):
                 if idx < len(classes) and classes[idx] != "Batterie":
@@ -334,9 +315,6 @@ class DataProcessor:
         for key, suffix in extras:
             if key in data:
                 arr = data.get(key)
-                logging.debug(
-                    "Per-inverter extra '%s' present; publishing as %s", key, suffix
-                )
                 for idx, name in enumerate(inv_names):
                     try:
                         raw = safe_get(arr, idx)
@@ -351,7 +329,6 @@ class DataProcessor:
         block_801 = data.get("801") if isinstance(data, dict) else None
         if isinstance(block_801, dict) and "175" in block_801 and sg_names:
             sg_data = block_801["175"]
-            logging.debug("Switch group data: %s", sg_data)
             for sgsj in range(min(MAX_SWITCH_GROUPS, len(sg_names))):
                 sg_name = sg_names[sgsj]
                 if not sg_name:
@@ -451,13 +428,6 @@ class DataProcessor:
                 first_status = data['608'].get('0', data['608'].get(0, ''))
             if first_status is not None and "DENIED" in str(first_status):
                 raise AccessDeniedError("Solar Log access denied")
-        logging.debug("Fast poll data keys: %s", list(data.keys()))
-        known_fast = {"608", "780", "781", "782", "794", "801", "858"}
-        extra_fast = {str(k) for k in data.keys()} - known_fast
-        if extra_fast:
-            logging.debug(
-                "Fast poll contains extra keys not handled: %s", sorted(extra_fast)
-            )
         await self.process_inverter_status(data)
         await self.process_inverter_extras(data)
         await self.process_switch_group_states(data)
@@ -553,7 +523,6 @@ class DataProcessor:
                         f"INV/{inverter_name}/daysum",
                         int(daysum_value) if daysum_value else 0,
                     )
-            logging.info("Processed day sums for %s inverters", nam_length)
         except Exception:
             logging.exception("Inverter day sums processing error")
 
@@ -629,7 +598,6 @@ class DataProcessor:
 
     async def process_periodic_poll(self, data: dict[str, Any]) -> None:
         """Process periodic poll payload (777/778/801/170 + switch groups elsewhere)."""
-        logging.debug("Polling data keys: %s", list(data.keys()))
         if "777" in data and "0" in data["777"] and self.devices.inverter_names:
             await self.process_inverter_day_sums(data["777"]["0"])
         if "778" in data and "0" in data["778"]:
@@ -640,35 +608,10 @@ class DataProcessor:
             json_data = block_801.get("170", block_801.get(170))
         if json_data is not None:
 
-            # Diagnostic: unknown keys in 801/170
-            if isinstance(json_data, dict):
-                present_keys = set()
-                for k in json_data.keys():
-                    try:
-                        present_keys.add(int(k))
-                    except Exception:
-                        continue
-                expected = set(range(100, 117))
-                extra = present_keys - expected
-                missing = expected - present_keys
-                if extra:
-                    logging.debug(
-                        "801/170 contains extra keys not handled: %s", sorted(extra)
-                    )
-                if missing:
-                    logging.debug("801/170 missing expected keys: %s", sorted(missing))
-
             pac_val = int(safe_get(json_data, 101, 0))
             pdc_val = int(safe_get(json_data, 102, 0))
             uac_val = int(safe_get(json_data, 103, 0))
             udc_val = int(safe_get(json_data, 104, 0))
-            logging.debug(
-                "801/170 periodic: pac=%s pdc=%s uac=%s udc=%s",
-                pac_val,
-                pdc_val,
-                uac_val,
-                udc_val,
-            )
             # Do not overwrite fast-poll values with zeros; publish only if > 0
             if pac_val > 0:
                 self.publish("status/pac", pac_val)

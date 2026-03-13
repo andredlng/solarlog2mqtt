@@ -73,13 +73,9 @@ class HistoricProcessor:
     ) -> None:
         """Process 854/877/878 historic payloads from /getjp API."""
         try:
-            logging.debug("Historic data response keys: %s", list(data.keys()))
             # 854: per-inverter yearly data
             if "854" in data:
                 data_year = data["854"]
-                logging.debug(
-                    "Processing yearly data (854): %s entries", len(data_year)
-                )
                 for entry in data_year:
                     if len(entry) >= 2 and entry[1]:
                         year = entry[0][-2:]
@@ -93,9 +89,6 @@ class HistoricProcessor:
             # 877: monthly totals and self-cons metrics
             if "877" in data:
                 data_month_tot = data["877"]
-                logging.debug(
-                    "Processing monthly totals (877): %s entries", len(data_month_tot)
-                )
                 if len(data_month_tot) >= 2:
                     self._publish_selfcons_pair(
                         data_month_tot[-1], data_month_tot[-2],
@@ -106,9 +99,6 @@ class HistoricProcessor:
             # 878: yearly totals and self-cons metrics
             if "878" in data:
                 data_year_tot = data["878"]
-                logging.debug(
-                    "Processing yearly totals (878): %s entries", len(data_year_tot)
-                )
                 if len(data_year_tot) >= 2:
                     self._publish_selfcons_pair(
                         data_year_tot[-1], data_year_tot[-2],
@@ -122,7 +112,6 @@ class HistoricProcessor:
     async def process_months_json(self, data: list[Any]) -> None:
         """Process /months.json payload for monthly historic and ratios."""
         try:
-            logging.debug("Processing monthly JSON data: %s entries", len(data))
             self._publish_period_entries(data, "monthly")
             if len(data) >= 2:
                 self._publish_selfcons_pair(
@@ -136,7 +125,6 @@ class HistoricProcessor:
     async def process_years_json(self, data: list[Any]) -> None:
         """Process /years.json payload for yearly historic and ratios."""
         try:
-            logging.debug("Processing yearly JSON data: %s entries", len(data))
             self._publish_period_entries(data, "yearly")
             if len(data) >= 2:
                 self._publish_selfcons_pair(

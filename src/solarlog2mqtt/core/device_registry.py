@@ -43,7 +43,6 @@ class DeviceRegistry:
             info_idx = info_code
 
         device_info = safe_get(self.device_list, info_idx)
-        logging.debug("device_list[%s] = %s", info_code, device_info)
 
         if not device_info:
             logging.debug("No device_info for index %s", info_idx)
@@ -93,12 +92,6 @@ class DeviceRegistry:
     async def classify_devices(self) -> None:
         """Classify devices using discovered lists and populate device metadata."""
         try:
-            logging.debug(
-                "Classifying devices - device_list available: %s, brand_list available: %s, device_infos len: %s",
-                self.device_list is not None,
-                self.brand_list is not None,
-                len(self.device_infos),
-            )
             if not self.device_list or not self.brand_list or not self.device_infos:
                 logging.warning(
                     "Device classification data not available, using placeholders"
@@ -149,7 +142,6 @@ class DeviceRegistry:
             self.brand_list = data["744"]
             logging.debug("Brand list: %s", self.brand_list)
 
-        logging.debug("About to process '740' data...")
         try:
             if "740" in data:
                 data_740 = as_dict(data.get("740"), ctx="740") or {}
@@ -159,7 +151,6 @@ class DeviceRegistry:
                 statusuz = ""
                 while statusuz != "Err" and numinv < 100:
                     statusuz = data_740.get(str(numinv), "Err")  # type: ignore[assignment]
-                    logging.debug("Checking device %s: status = %s", numinv, statusuz)
                     if statusuz != "Err":
                         numinv += 1
                     else:

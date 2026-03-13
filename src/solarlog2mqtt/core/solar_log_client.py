@@ -131,7 +131,6 @@ class SolarLogClient:
 
         try:
             headers = _get_logcheck_headers(self.data_token)
-            logging.debug("Starting LogCheck")
             async with self.session.get(
                 f"{self.device_address}/logcheck?",
                 headers=headers,
@@ -139,7 +138,6 @@ class SolarLogClient:
             ) as response:
                 if response.status == 200:
                     body = await response.text()
-                    logging.debug("LogCheck response: %s", body)
                     parts = body.split(";")
                     if parts and parts[0] != "0":
                         return True
@@ -165,7 +163,6 @@ class SolarLogClient:
                 async with self.session.get(
                     url, headers=headers, timeout=HTTP_TIMEOUT_SECONDS
                 ) as response:
-                    logging.debug("HTTP GET %s -> %s", url, response.status)
                     if response.status == 200:
                         text = await response.text()
                         try:
@@ -182,14 +179,12 @@ class SolarLogClient:
                     self.device_address, self.data_token, banner_hidden=False
                 )
                 post_data = f"token={self.data_token};preval=none;{request_data}"
-                logging.debug("POST /getjp data: %s...", post_data[:100])
                 async with self.session.post(
                     f"{self.device_address}/getjp",
                     data=post_data,
                     headers=headers,
                     timeout=HTTP_TIMEOUT_SECONDS,
                 ) as response:
-                    logging.debug("HTTP POST /getjp -> %s", response.status)
                     if response.status == 200:
                         text = await response.text()
                         try:

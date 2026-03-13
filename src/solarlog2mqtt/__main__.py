@@ -5,7 +5,6 @@ import os
 import iot_daemonize
 import iot_daemonize.configuration as configuration
 
-from .core.logging_config import configure_logging
 from .core.constants import DEFAULT_RESTART_DELAY, DEFAULT_HEALTH_CHECK_INTERVAL
 from .core.config_schema import validate_config
 from .core.bridge import SolarLogBridge
@@ -67,11 +66,6 @@ def create_config():
     cfg.add_config_arg('display_monitoring', flags='--display_monitoring', default=False,
                        action='store_true',
                        help='Enable detailed display status monitoring.')
-    cfg.add_config_arg('log_level', flags='--log_level', default='INFO',
-                       help='Logging level. Default is INFO.')
-    cfg.add_config_arg('log_format', flags='--log_format', default='text',
-                       help='Logging format: text or json. Default is text.')
-
     cfg.parse_args()
     return cfg
 
@@ -116,12 +110,6 @@ def main():
 
     coerce_config_types(config)
     validate_config(config)
-
-    # Configure logging BEFORE iot_daemonize.init() so the framework's basicConfig() is a no-op
-    level_name = getattr(config, 'log_level', 'INFO')
-    log_format = getattr(config, 'log_format', 'text')
-    verbose = getattr(config, 'verbose', False)
-    configure_logging(level_name, log_format, verbose)
 
     iot_daemonize.init(config, mqtt=True, daemonize=True)
 

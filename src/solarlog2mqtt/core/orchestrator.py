@@ -54,7 +54,6 @@ async def get_forecast_data(
     total_power_w: int | None = None,
 ) -> None:
     try:
-        logging.debug("Getting forecast data from forecast.solar API")
         if not all([daemon_args.forecast_latitude, daemon_args.forecast_longitude]):
             logging.warning(
                 "Forecast API requires latitude and longitude configuration"
@@ -63,9 +62,6 @@ async def get_forecast_data(
         total_power_kw = 5.0
         if total_power_w and total_power_w > 0:
             total_power_kw = total_power_w / 1000
-            logging.debug(
-                "Using stored total power: %sW (%skW)", total_power_w, total_power_kw
-            )
         forecast_url = "https://api.forecast.solar/estimate/watthours/day/"
         url_prog = f"{forecast_url}{daemon_args.forecast_latitude}/{daemon_args.forecast_longitude}/{daemon_args.forecast_declination}/{daemon_args.forecast_azimuth}/{total_power_kw}"
         logging.debug("Forecast API request: %s", url_prog)
@@ -110,8 +106,6 @@ async def health_check(solar_log_client, publish_fn: PublishFn) -> bool:
         publish_fn("health/overall", overall_health)
         if not overall_health:
             logging.warning("Health check failed: %s", health_status)
-        else:
-            logging.debug("Health check passed")
         return overall_health
     except Exception:
         logging.exception("health_check error")

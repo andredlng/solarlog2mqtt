@@ -72,7 +72,7 @@ class SolarLogBridge:
                 or not self.data_processor.brand_list
             ):
                 attempt += 1
-                logging.info(f"Startup attempt #{attempt}: requesting device metadata (739/744)")
+                logging.debug(f"Startup attempt #{attempt}: requesting device metadata (739/744)")
                 try:
                     await self.make_request(STARTUP_DATA)
                 except Exception:
@@ -84,7 +84,7 @@ class SolarLogBridge:
                     logging.info("Startup device metadata present (739/744)")
                     break
 
-                logging.info(f"Startup metadata not available yet; retrying in {delay}s")
+                logging.debug(f"Startup metadata not available yet; retrying in {delay}s")
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, max_delay)
 
@@ -105,8 +105,6 @@ class SolarLogBridge:
                 if self.data_processor and self.data_processor.num_inverters > 0
                 else MAX_DEVICES_DISCOVERY
             )
-            logging.debug(f"Requesting device info for up to {max_devices} devices")
-
             inverter_data_array = []
             for i in range(max_devices):
                 inverter_data_array.append(f'"{i}":{{"119":null,"162":null}}')
@@ -151,12 +149,12 @@ class SolarLogBridge:
                 logging.info("Starting startup sequence (inverter import enabled)")
                 await self.perform_startup_sequence(stop)
                 try:
-                    logging.info("Seeding first periodic poll (777/778/801)")
+                    logging.debug("Seeding first periodic poll (777/778/801)")
                     await self.make_request(POLLING_DATA)
                 except Exception:
                     logging.exception("Error seeding first periodic poll")
             else:
-                logging.info("Requesting basic startup data (inverter import disabled)")
+                logging.debug("Requesting basic startup data (inverter import disabled)")
                 await self.make_request(
                     '{"610":null,"611":null,"617":null,"706":null,"800":{"100":null,"160":null},"801":{"101":null,"102":null}}'
                 )
@@ -213,7 +211,7 @@ class SolarLogBridge:
                     next_run += timedelta(days=1)
 
                 sleep_seconds = (next_run - now).total_seconds()
-                logging.info(
+                logging.debug(
                     "Historic data scheduled for {}, sleeping {:.1f} hours".format(next_run, sleep_seconds / 3600)
                 )
                 await asyncio.sleep(sleep_seconds)
@@ -221,18 +219,18 @@ class SolarLogBridge:
                 if stop():
                     break
 
-                logging.info('Getting long term historic data')
+                logging.debug('Getting long term historic data')
 
                 solar_log_model = self.data_processor.solar_log_model if self.data_processor else None
                 if solar_log_model == 500:
-                    logging.info("Solar Log model 500 detected - requesting 854 data only")
+                    logging.debug("Solar Log model 500 detected - requesting 854 data only")
                     await self.make_request('{"854": null}')
                     await asyncio.sleep(2)
                     await self.make_request('/months.json?_=')
                     await asyncio.sleep(5)
                     await self.make_request('/years.json?_=')
                 else:
-                    logging.info("Solar Log model {} - requesting full historic data".format(solar_log_model))
+                    logging.debug("Solar Log model {} - requesting full historic data".format(solar_log_model))
                     await self.make_request(HISTORIC_DATA)
                     await asyncio.sleep(2)
                     await self.make_request('/months.json?_=')
@@ -285,7 +283,7 @@ class SolarLogBridge:
                 self.data_processor.publish('info/restart_reason', reason)
 
             restart_delay = getattr(self.config, 'restart_delay', DEFAULT_RESTART_DELAY)
-            logging.info("Waiting {} seconds before restart...".format(restart_delay))
+            logging.debug("Waiting {} seconds before restart...".format(restart_delay))
             await asyncio.sleep(restart_delay)
 
             logging.info("Restarting Solar Log bridge...")

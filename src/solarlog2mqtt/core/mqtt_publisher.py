@@ -10,9 +10,8 @@ import iot_daemonize
 class MQTTPublisher:
     """Publish values to MQTT via the iot_daemonize framework."""
 
-    def __init__(self, base_topic: str, *, enable_timestamp: bool = False) -> None:
+    def __init__(self, base_topic: str) -> None:
         self.base_topic = base_topic.rstrip('/')
-        self.enable_timestamp = enable_timestamp
 
     def publish(self, topic: str, value: str | int | float | bool) -> None:
         """Publish a value under base_topic, delegating to iot_daemonize."""

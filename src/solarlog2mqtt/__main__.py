@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional, Union
+from typing import Optional
 
 import iot_daemonize
 import iot_daemonize.configuration as configuration
@@ -25,6 +25,7 @@ from .core.constants import (
 from .core.config_schema import validate_config
 from .core.mqtt_publisher import MQTTPublisher
 from .core.data_processor import DataProcessor
+from .core.exceptions import AccessDeniedError
 from .core.orchestrator import (
     get_forecast_data as orchestrator_get_forecast_data,
     health_check as orchestrator_health_check,
@@ -136,60 +137,39 @@ def coerce_config_types(cfg):
         cfg._config_values[key] = str(val).lower() in ('true', '1', 'yes')
 
 
-# --- Request helpers ---
+# --- Request helper ---
 
-async def log_check(data_lc: Optional[str] = None) -> bool:
-    """Check authentication status and make request if data is provided."""
-    global solar_log_client
+async def make_request(req_data=None):
+    """Make a request to the Solar-Log device and dispatch the response.
 
+    Without req_data, checks login status. With req_data, sends the request,
+    dispatches to DataProcessor.process_response, and handles failures.
+    """
     if not solar_log_client:
         return False
 
-    try:
-        if data_lc:
-            result = await solar_log_client.request_with_retry(data_lc, attempts=3, base_delay=1.0)
-            if result is not None:
-                await process_response(data_lc, result)
-                return True
-            if solar_log_client.request_counter > MAX_REQUEST_FAILURES:
-                logging.warning("Too many request failures during log_check, initiating restart")
-                await restart_bridge("Request failures")
-            return False
-        else:
-            return await solar_log_client.check_login_status()
-
-    except Exception:
-        logging.exception("Error in log_check")
-        return False
-
-async def https_request(req_data: str) -> None:
-    """Make a request using the SolarLogClient."""
-    global solar_log_client
-
-    if not solar_log_client:
-        return
+    if req_data is None:
+        return await solar_log_client.check_login_status()
 
     try:
         result = await solar_log_client.request_with_retry(req_data, attempts=3, base_delay=1.0)
         if result is not None:
-            if '.json' in req_data:
-                await process_json_response(req_data, result)
-            else:
-                await process_response(req_data, result)
-        else:
-            if solar_log_client.request_counter > MAX_REQUEST_FAILURES:
-                logging.warning("Too many request failures, initiating restart")
-                await restart_bridge("Request failures")
-
-    except Exception:
-        logging.exception("Error in https_request")
+            await data_processor.process_response(req_data, result)
+            return True
+        if solar_log_client.request_counter > MAX_REQUEST_FAILURES:
+            logging.warning("Too many request failures, initiating restart")
+            await restart_bridge("Request failures")
+        return False
+    except AccessDeniedError:
+        logging.warning("Solar Log access denied - initiating restart")
+        await restart_bridge("Access denied")
+        return False
 
 
 # --- Startup sequence ---
 
 async def perform_startup_sequence(stop):
     """Retry startup until device tables (739/744) are present, then fetch device info."""
-    global data_processor
     attempt = 0
     delay = 2
     max_delay = 60
@@ -200,9 +180,9 @@ async def perform_startup_sequence(stop):
             attempt += 1
             logging.info(f"Startup attempt #{attempt}: requesting device metadata (739/744)")
             try:
-                await log_check(STARTUP_DATA)
+                await make_request(STARTUP_DATA)
             except Exception:
-                logging.exception("Error during startup log_check")
+                logging.exception("Error during startup make_request")
 
             await asyncio.sleep(1)
 
@@ -225,7 +205,6 @@ async def perform_startup_sequence(stop):
         logging.exception("Startup sequence failure")
 
 async def request_device_info():
-    global data_processor
     try:
         max_devices = data_processor.num_inverters if data_processor and data_processor.num_inverters > 0 else MAX_DEVICES_DISCOVERY
         logging.debug(f"Requesting device info for up to {max_devices} devices")
@@ -237,176 +216,10 @@ async def request_device_info():
         device_info_request = '{"141":{' + ','.join(inverter_data_array) + '}}'
         logging.debug("Device info request: {}".format(device_info_request))
 
-        await https_request(device_info_request)
+        await make_request(device_info_request)
 
     except Exception:
-        logging.exception("process_response error")
-
-
-# --- Response processing ---
-
-async def process_response(req_data, data):
-    try:
-        logging.debug("Processing data for request: {}...".format(req_data[:10]))
-
-        if req_data.startswith('{"152"'):
-            await process_startup_data(data)
-        elif req_data.startswith('{"141"'):
-            await process_device_info_data(data)
-        elif req_data.startswith('{"447"'):
-            await process_polling_data(data)
-        elif req_data.startswith('{"608"'):
-            await process_fast_poll_data(data)
-        elif req_data.startswith('{"801"'):
-            await process_basic_data(data)
-        elif req_data.startswith('{"854"'):
-            await process_historic_data_response(req_data, data)
-
-    except Exception:
-        logging.exception("process_json_response error")
-
-async def process_json_response(req_data, data):
-    try:
-        if req_data.startswith('/months.json'):
-            if data_processor:
-                await data_processor.process_months_json(data)
-        elif req_data.startswith('/years.json'):
-            if data_processor:
-                await data_processor.process_years_json(data)
-    except Exception:
-        logging.exception("process_device_info_data error")
-
-
-async def process_startup_data(data: Dict[str, Any]) -> None:
-    """Process startup data using the global DataProcessor instance."""
-    global data_processor
-
-    if data_processor:
-        await data_processor.process_startup_data(data)
-    else:
-        logging.error("No data processor available")
-
-async def process_polling_data(data):
-    global data_processor
-    try:
-        logging.debug("Polling data keys: {}".format(list(data.keys())))
-        if data_processor:
-            await data_processor.process_periodic_poll(data)
-        if '447' in data and data_processor:
-            await data_processor.process_switch_group_details(data['447'])
-        if data_processor:
-            block_801 = data.get('801', data.get(801)) if isinstance(data, dict) else None
-            json_data = None
-            if isinstance(block_801, dict):
-                json_data = block_801.get('170', block_801.get(170))
-            if isinstance(json_data, dict):
-                try:
-                    total_power = int(json_data.get(116, json_data.get('116', 0)))
-                except Exception:
-                    total_power = 0
-                publish_to_mqtt('info/totalPower', total_power)
-                data_processor.total_power_w = total_power
-    except Exception:
-        logging.exception("process_basic_data error")
-
-async def check_access_denied(data: Dict[str, Any]) -> bool:
-    """Check if access is denied and restart if needed."""
-    if '608' in data and data['608']:
-        first_status = None
-        if isinstance(data['608'], list) and len(data['608']) > 0:
-            first_status = data['608'][0]
-        elif isinstance(data['608'], dict):
-            first_status = data['608'].get('0', data['608'].get(0, ''))
-        if first_status is not None and "DENIED" in str(first_status):
-            logging.warning("Solar Log access denied - initiating restart")
-            await restart_bridge("Access denied")
-            return True
-    return False
-
-
-async def process_fast_poll_data(data):
-    try:
-        logging.debug("Fast poll data keys: {}".format(list(data.keys())))
-
-        if await check_access_denied(data):
-            return
-
-        if data_processor:
-            await data_processor.process_fast_poll(data)
-
-    except Exception:
-        logging.exception("start_polling error")
-
-async def process_device_info_data(data):
-    global data_processor
-    try:
-        logging.debug(f"Device info data: {data}")
-
-        if '141' in data:
-            device_data = data['141']
-
-            indices = None
-            if data_processor and data_processor.num_inverters > 0:
-                indices = list(range(data_processor.num_inverters))
-            else:
-                indices_set = set()
-                for k in device_data.keys():
-                    if isinstance(k, int):
-                        indices_set.add(k)
-                    elif isinstance(k, str) and k.isdigit():
-                        indices_set.add(int(k))
-                indices = sorted(indices_set)
-                num_detected = len(indices)
-                if num_detected > 0 and data_processor:
-                    data_processor.num_inverters = num_detected
-                    publish_to_mqtt('info/numinv', max(data_processor.num_inverters - 1, 0))
-
-            inv_names: List[str] = []
-            infos: List[int] = []
-
-            for i in indices:
-                key = str(i)
-                if key in device_data:
-                    device_entry = device_data[key]
-
-                    name = device_entry.get('119', f'Inverter_{i}')
-                    info_code = device_entry.get('162', 0)
-
-                    inv_names.append(name)
-                    infos.append(info_code)
-
-                    logging.debug(f"Device {i}: {name}, Info: {info_code}")
-
-            logging.info("Discovered {} devices: {}".format(len(inv_names), inv_names))
-
-            if data_processor:
-                data_processor.inverter_names = inv_names.copy()
-                data_processor.device_infos = infos.copy()
-
-            if data_processor:
-                await data_processor.classify_devices()
-                await data_processor.publish_device_info()
-
-    except Exception:
-        logging.exception("process_device_info_data error")
-
-
-async def process_basic_data(data):
-    try:
-        if '801' in data and '170' in data['801']:
-            await process_polling_data(data)
-    except Exception:
-        logging.exception("process_basic_data error")
-
-
-def publish_to_mqtt(topic: str, value: Union[str, int, float, bool]) -> None:
-    """Publish a value to MQTT using the global MQTTPublisher instance."""
-    global mqtt_publisher
-
-    if mqtt_publisher:
-        mqtt_publisher.publish(topic, value)
-    else:
-        logging.warning(f"No MQTT publisher available for topic {topic}: {value}")
+        logging.exception("request_device_info error")
 
 
 # --- Polling loops ---
@@ -414,7 +227,7 @@ def publish_to_mqtt(topic: str, value: Union[str, int, float, bool]) -> None:
 async def start_polling(stop):
     try:
         if config.solarlog_user and config.solarlog_password:
-            if not await log_check():
+            if not await make_request():
                 await asyncio.sleep(2)
 
         if config.inverter_import:
@@ -422,12 +235,12 @@ async def start_polling(stop):
             await perform_startup_sequence(stop)
             try:
                 logging.info("Seeding first periodic poll (777/778/801)")
-                await log_check(POLLING_DATA)
+                await make_request(POLLING_DATA)
             except Exception:
                 logging.exception("Error seeding first periodic poll")
         else:
             logging.info("Requesting basic startup data (inverter import disabled)")
-            await log_check('{"610":null,"611":null,"617":null,"706":null,"800":{"100":null,"160":null},"801":{"101":null,"102":null}}')
+            await make_request('{"610":null,"611":null,"617":null,"706":null,"800":{"100":null,"160":null},"801":{"101":null,"102":null}}')
             await asyncio.sleep(1)
 
         if config.inverter_import:
@@ -466,7 +279,7 @@ async def start_polling(stop):
 async def fast_polling_loop(stop):
     while not stop():
         try:
-            await log_check(FAST_POLL_DATA)
+            await make_request(FAST_POLL_DATA)
             await asyncio.sleep(config.poll_interval_current)
 
         except Exception:
@@ -476,7 +289,7 @@ async def fast_polling_loop(stop):
 async def regular_polling_loop(stop):
     while not stop():
         try:
-            await log_check(POLLING_DATA)
+            await make_request(POLLING_DATA)
             await asyncio.sleep(config.poll_interval_periodic)
 
         except Exception:
@@ -503,18 +316,18 @@ async def historic_polling_loop(stop):
             solar_log_model = data_processor.solar_log_model if data_processor else None
             if solar_log_model == 500:
                 logging.info("Solar Log model 500 detected - requesting 854 data only")
-                await log_check('{"854": null}')
+                await make_request('{"854": null}')
                 await asyncio.sleep(2)
-                await https_request('/months.json?_=')
+                await make_request('/months.json?_=')
                 await asyncio.sleep(5)
-                await https_request('/years.json?_=')
+                await make_request('/years.json?_=')
             else:
                 logging.info("Solar Log model {} - requesting full historic data".format(solar_log_model))
-                await log_check(HISTORIC_DATA)
+                await make_request(HISTORIC_DATA)
                 await asyncio.sleep(2)
-                await https_request('/months.json?_=')
+                await make_request('/months.json?_=')
                 await asyncio.sleep(5)
-                await https_request('/years.json?_=')
+                await make_request('/years.json?_=')
 
         except Exception:
             logging.exception("historic_polling_loop error")
@@ -524,7 +337,7 @@ async def historic_polling_loop(stop):
 async def simple_polling_loop(stop):
     while not stop():
         try:
-            await log_check('{"801":{"170":null}}')
+            await make_request('{"801":{"170":null}}')
             await asyncio.sleep(config.poll_interval_current)
 
         except Exception:
@@ -540,7 +353,7 @@ async def forecast_polling_loop(stop):
             while not stop():
                 last_power = data_processor.total_power_w if data_processor else None
                 await orchestrator_get_forecast_data(
-                    config, solar_log_client, publish_to_mqtt, total_power_w=last_power
+                    config, solar_log_client, mqtt_publisher.publish, total_power_w=last_power
                 )
 
                 now = datetime.now()
@@ -558,7 +371,7 @@ async def forecast_polling_loop(stop):
 async def health_check_loop(stop):
     while not stop():
         try:
-            await orchestrator_health_check(mqtt_publisher, solar_log_client, publish_to_mqtt)
+            await orchestrator_health_check(mqtt_publisher, solar_log_client, mqtt_publisher.publish)
             await asyncio.sleep(config.health_check_interval)
         except Exception:
             logging.exception("health_check_loop error")
@@ -570,8 +383,9 @@ async def health_check_loop(stop):
 async def restart_bridge(reason):
     try:
         logging.warning("Bridge restart initiated due to: {}".format(reason))
-        publish_to_mqtt('info/connection', False)
-        publish_to_mqtt('info/restart_reason', reason)
+        if mqtt_publisher:
+            mqtt_publisher.publish('info/connection', False)
+            mqtt_publisher.publish('info/restart_reason', reason)
 
         restart_delay = getattr(config, 'restart_delay', DEFAULT_RESTART_DELAY)
         logging.info("Waiting {} seconds before restart...".format(restart_delay))
@@ -609,7 +423,6 @@ async def start_solarlog_bridge(stop):
         # Initialize MQTT Publisher (connection handled by iot_daemonize framework)
         mqtt_publisher = MQTTPublisher(
             base_topic=config.mqtt_topic,
-            enable_timestamp=config.timestamp
         )
 
         # Initialize DataProcessor
@@ -627,7 +440,6 @@ async def start_solarlog_bridge(stop):
 
 async def stop_solarlog():
     """Stop the bridge — only close SolarLogClient; MQTT is handled by framework."""
-    global solar_log_client
     logging.info("Stopping SolarLog2MQTT bridge")
 
     if solar_log_client:

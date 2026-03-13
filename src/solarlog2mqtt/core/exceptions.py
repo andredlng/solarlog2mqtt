@@ -17,6 +17,10 @@ class AuthError(SolarLogError):
     """Authentication or authorization failed."""
 
 
+class AccessDeniedError(SolarLogError):
+    """Solar Log device denied access (608 DENIED)."""
+
+
 @dataclass(slots=True)
 class RequestError(SolarLogError):
     """HTTP request failed or returned unexpected status."""

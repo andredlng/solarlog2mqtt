@@ -13,10 +13,12 @@ from datetime import datetime, timedelta
 from .api_validation import as_dict
 from .constants import (
     MAX_SWITCH_GROUPS,
+    MAX_DEVICES_DISCOVERY,
     DEFAULT_SETPOINT_DAILY_DIVISOR,
     DEVICE_CLASS_LIST,
     DAYS_TO_CHECK_HISTORY,
 )
+from .exceptions import AccessDeniedError
 
 if TYPE_CHECKING:  # Avoid runtime import cycle during initial skeleton stage
     from .mqtt_publisher import MQTTPublisher
@@ -53,6 +55,20 @@ class DataProcessor:
         # Last known total power (W) for forecast helper
         self.total_power_w: int = 0
 
+    @staticmethod
+    def _selfcons_ratio(selfcons: int | float, total: int | float) -> float:
+        """Self-consumption as percentage with 1 decimal. Returns 0 if total <= 0."""
+        if total <= 0:
+            return 0
+        return round((selfcons / total) * 1000) / 10
+
+    @staticmethod
+    def _selfcons_ratio_kwh(selfcons_kwh: int | float, consumption_wh: int | float) -> float:
+        """Self-consumption ratio for kWh selfcons vs Wh consumption. Returns 0 if consumption <= 0."""
+        if consumption_wh <= 0:
+            return 0
+        return round(((selfcons_kwh * 1000) / consumption_wh) * 1000) / 10
+
     def publish(self, topic: str, value: str | int | float | bool) -> None:
         """Publish a value to MQTT via the configured publisher.
 
@@ -61,6 +77,75 @@ class DataProcessor:
         """
         if self.mqtt_publisher:
             self.mqtt_publisher.publish(topic, value)
+
+    async def process_response(self, req_data: str, data: Any) -> None:
+        """Unified dispatcher for all Solar-Log response types."""
+        logging.debug("Processing data for request: %s...", req_data[:10])
+        if req_data.startswith('/months.json'):
+            await self.process_months_json(data)
+        elif req_data.startswith('/years.json'):
+            await self.process_years_json(data)
+        elif req_data.startswith('{"152"'):
+            await self.process_startup_data(data)
+        elif req_data.startswith('{"141"'):
+            await self.process_device_info(data)
+        elif req_data.startswith('{"447"'):
+            await self.process_periodic_poll(data)
+        elif req_data.startswith('{"608"'):
+            await self.process_fast_poll(data)
+        elif req_data.startswith('{"801"'):
+            if '801' in data and isinstance(data.get('801'), dict) and '170' in data['801']:
+                await self.process_periodic_poll(data)
+        elif req_data.startswith('{"854"'):
+            await self.process_historic_response(req_data, data)
+
+    async def process_device_info(self, data: dict[str, Any]) -> None:
+        """Process device info response (block 141) — inverter names and info codes."""
+        try:
+            logging.debug("Device info data: %s", data)
+            if '141' not in data:
+                return
+
+            device_data = data['141']
+
+            if self.num_inverters > 0:
+                indices = list(range(self.num_inverters))
+            else:
+                indices_set: set[int] = set()
+                for k in device_data.keys():
+                    if isinstance(k, int):
+                        indices_set.add(k)
+                    elif isinstance(k, str) and k.isdigit():
+                        indices_set.add(int(k))
+                indices = sorted(indices_set)
+                num_detected = len(indices)
+                if num_detected > 0:
+                    self.num_inverters = num_detected
+                    self.publish('info/numinv', max(self.num_inverters - 1, 0))
+
+            inv_names: list[str] = []
+            infos: list[int] = []
+
+            for i in indices:
+                key = str(i)
+                if key in device_data:
+                    device_entry = device_data[key]
+                    name = device_entry.get('119', f'Inverter_{i}')
+                    info_code = device_entry.get('162', 0)
+                    inv_names.append(name)
+                    infos.append(info_code)
+                    logging.debug("Device %s: %s, Info: %s", i, name, info_code)
+
+            logging.info("Discovered %s devices: %s", len(inv_names), inv_names)
+
+            self.inverter_names = inv_names.copy()
+            self.device_infos = infos.copy()
+
+            await self.classify_devices()
+            await self.publish_device_info()
+
+        except Exception:
+            logging.exception("process_device_info error")
 
     async def process_startup_data(self, data: dict[str, Any]) -> None:
         """Process startup data and extract device information.
@@ -95,12 +180,76 @@ class DataProcessor:
         except Exception:
             logging.exception("Startup data processing error")
 
-    async def classify_devices(self) -> None:
-        """Classify devices using discovered lists and populate device metadata.
+    @staticmethod
+    def _get_indexed(container: Any, idx: Any) -> Any:
+        """Retrieve item from a list or dict by numeric or string key."""
+        if container is None:
+            return None
+        if isinstance(container, list):
+            return container[idx] if 0 <= idx < len(container) else None
+        if isinstance(container, dict):
+            if idx in container:
+                return container[idx]
+            return container.get(str(idx))
+        return None
 
-        Determines device type, brand, and class (battery detection) from
-        device_list/brand_list tables and the collected device_infos.
-        """
+    def _classify_single_device(self, i: int, name: str, info_code: int) -> tuple[str, str, str, bool]:
+        """Classify one device. Returns (type, brand, class, is_battery)."""
+        try:
+            info_idx = int(info_code)
+        except Exception:
+            info_idx = info_code
+
+        device_info = self._get_indexed(self.device_list, info_idx)
+        logging.debug("device_list[%s] = %s", info_code, device_info)
+
+        if not device_info:
+            logging.debug("No device_info for index %s", info_idx)
+            return "Unknown", "Unknown", "Wechselrichter", False
+
+        # Device type (index 1)
+        device_type = (
+            device_info[1]
+            if isinstance(device_info, (list, tuple)) and len(device_info) > 1
+            else "Unknown"
+        )
+
+        # Brand via brand_list[device_info[0]]
+        brand_idx_val = (
+            device_info[0]
+            if isinstance(device_info, (list, tuple)) and len(device_info) > 0
+            else 0
+        )
+        try:
+            brand_idx_int = int(brand_idx_val)
+        except Exception:
+            brand_idx_int = brand_idx_val
+        device_brand = self._get_indexed(self.brand_list, brand_idx_int) or "Unknown"
+
+        # Device class from bitmask at index 5
+        device_class = "Wechselrichter"
+        if isinstance(device_info, (list, tuple)) and len(device_info) > 5:
+            try:
+                dclass_val = int(device_info[5])
+            except Exception:
+                dclass_val = 0
+            if dclass_val > 0:
+                class_idx = int(math.log2(dclass_val))
+                if 0 <= class_idx < len(DEVICE_CLASS_LIST):
+                    device_class = DEVICE_CLASS_LIST[class_idx]
+
+        is_battery = device_class == "Batterie"
+        if is_battery:
+            logging.info("Battery device detected at index %s: %s", i, name)
+
+        logging.debug(
+            "Device %s (%s): Type=%s, Brand=%s, Class=%s",
+            i, name, device_type, device_brand, device_class,
+        )
+        return device_type, device_brand, device_class, is_battery
+
+    async def classify_devices(self) -> None:
+        """Classify devices using discovered lists and populate device metadata."""
         try:
             logging.debug(
                 "Classifying devices - device_list available: %s, brand_list available: %s, device_infos len: %s",
@@ -121,127 +270,26 @@ class DataProcessor:
             device_brands: list[str] = []
             device_classes: list[str] = []
             battery_index: list[int] = []
-            battery_device_present = False
-
-            def get_from_indexed(container, idx):
-                if container is None:
-                    return None
-                if isinstance(container, list):
-                    return container[idx] if 0 <= idx < len(container) else None
-                if isinstance(container, dict):
-                    if idx in container:
-                        return container[idx]
-                    return container.get(str(idx))
-                return None
 
             for i, (name, info_code) in enumerate(
                 zip(self.inverter_names, self.device_infos)
             ):
-                try:
-                    logging.debug(
-                        "Processing device %s (%s) with info_code %s",
-                        i,
-                        name,
-                        info_code,
-                    )
-
-                    try:
-                        info_idx = int(info_code)
-                    except Exception:
-                        info_idx = info_code
-
-                    device_info = get_from_indexed(self.device_list, info_idx)
-                    logging.debug("device_list[%s] = %s", info_code, device_info)
-
-                    if device_info:
-                        # Device type (index 1)
-                        if (
-                            isinstance(device_info, (list, tuple))
-                            and len(device_info) > 1
-                        ):
-                            device_type = device_info[1]
-                        else:
-                            device_type = "Unknown"
-                        device_types.append(device_type)
-
-                        # Brand via brand_list[device_info[0]]
-                        brand_idx_val = 0
-                        if (
-                            isinstance(device_info, (list, tuple))
-                            and len(device_info) > 0
-                        ):
-                            brand_idx_val = device_info[0]
-                        try:
-                            brand_idx_int = int(brand_idx_val)
-                        except Exception:
-                            brand_idx_int = brand_idx_val
-                        device_brand = get_from_indexed(self.brand_list, brand_idx_int)
-                        if device_brand is None:
-                            device_brand = "Unknown"
-                        device_brands.append(device_brand)
-
-                        # Device class from bitmask at index 5
-                        dclass_val = None
-                        if (
-                            isinstance(device_info, (list, tuple))
-                            and len(device_info) > 5
-                        ):
-                            try:
-                                dclass_val = int(device_info[5])
-                            except Exception:
-                                try:
-                                    dclass_val = int(str(device_info[5]).strip())
-                                except Exception:
-                                    dclass_val = None
-                        if dclass_val and dclass_val > 0:
-                            # 2^n mapping to index in DEVICE_CLASS_LIST
-                            class_idx = int(math.log(dclass_val) / math.log(2))
-                            device_class = (
-                                DEVICE_CLASS_LIST[class_idx]
-                                if 0 <= class_idx < len(DEVICE_CLASS_LIST)
-                                else "Wechselrichter"
-                            )
-                        else:
-                            device_class = "Wechselrichter"
-                        device_classes.append(device_class)
-
-                        if device_class == "Batterie":
-                            battery_device_present = True
-                            battery_index.append(i)
-                            logging.info(
-                                "Battery device detected at index %s: %s", i, name
-                            )
-
-                        logging.debug(
-                            "Device %s (%s): Type=%s, Brand=%s, Class=%s",
-                            i,
-                            name,
-                            device_type,
-                            device_brand,
-                            device_class,
-                        )
-                    else:
-                        logging.debug("No device_info for index %s", info_idx)
-                        device_types.append("Unknown")
-                        device_brands.append("Unknown")
-                        device_classes.append("Wechselrichter")
-
-                except (IndexError, ValueError, TypeError) as e:
-                    logging.debug("Error classifying device %s (%s): %s", i, name, e)
-                    device_types.append("Unknown")
-                    device_brands.append("Unknown")
-                    device_classes.append("Wechselrichter")
+                dtype, brand, dclass, is_batt = self._classify_single_device(i, name, info_code)
+                device_types.append(dtype)
+                device_brands.append(brand)
+                device_classes.append(dclass)
+                if is_batt:
+                    battery_index.append(i)
 
             logging.info(
                 "Device classification complete. Battery devices: %s (indices: %s)",
-                battery_device_present,
+                bool(battery_index),
                 battery_index,
             )
-            # Store results back
             self.device_types = device_types
             self.device_brands = device_brands
             self.device_classes = device_classes
-            self.battery_device_present = battery_device_present
+            self.battery_device_present = bool(battery_index)
             self.battery_index = battery_index
 
         except Exception:
@@ -408,21 +456,8 @@ class DataProcessor:
             if isinstance(data_152, list) and len(data_152) >= 12:
                 current_month = datetime.now().month
 
-                month_names = [
-                    "01",
-                    "02",
-                    "03",
-                    "04",
-                    "05",
-                    "06",
-                    "07",
-                    "08",
-                    "09",
-                    "10",
-                    "11",
-                    "12",
-                ]
-                for i, month in enumerate(month_names):
+                for i in range(12):
+                    month = f"{i+1:02d}"
                     if i < len(data_152):
                         monthly_setpoint = (data_152[i] / 100) * setpoint_year
                         self.publish(
@@ -610,6 +645,15 @@ class DataProcessor:
 
     async def process_fast_poll(self, data: dict[str, Any]) -> None:
         """Orchestrate processing of fast-poll payloads."""
+        # Check for access denied before processing
+        if '608' in data and data['608']:
+            first_status = None
+            if isinstance(data['608'], list) and len(data['608']) > 0:
+                first_status = data['608'][0]
+            elif isinstance(data['608'], dict):
+                first_status = data['608'].get('0', data['608'].get(0, ''))
+            if first_status is not None and "DENIED" in str(first_status):
+                raise AccessDeniedError("Solar Log access denied")
         logging.debug("Fast poll data keys: %s", list(data.keys()))
         # Diagnostic: unknown fast-poll keys
         known_fast = {"608", "780", "781", "782", "794", "801", "858"}
@@ -739,10 +783,7 @@ class DataProcessor:
                     entry_today[1] if len(entry_today) > 1 and entry_today[1] else 0
                 )
                 self.publish("SelfCons/selfconstoday", int(selfcons_today))
-                if self.last_yield_day > 0:
-                    dayratio = round((selfcons_today / self.last_yield_day) * 1000) / 10
-                else:
-                    dayratio = 0
+                dayratio = self._selfcons_ratio(selfcons_today, self.last_yield_day)
                 self.publish("SelfCons/selfconsratiotoday", dayratio)
                 self.last_selfcons_yesterday_fallback = selfcons_today
                 self.last_selfcons_ratio_yesterday_fallback = dayratio
@@ -778,13 +819,7 @@ class DataProcessor:
                     else 0
                 )
                 self.publish("SelfCons/selfconsyesterday", int(selfcons_yesterday))
-                if self.last_yield_yesterday > 0:
-                    dayratio_y = (
-                        round((selfcons_yesterday / self.last_yield_yesterday) * 1000)
-                        / 10
-                    )
-                else:
-                    dayratio_y = 0
+                dayratio_y = self._selfcons_ratio(selfcons_yesterday, self.last_yield_yesterday)
                 self.publish("SelfCons/selfconsratioyesterday", dayratio_y)
             else:
                 self.publish(
@@ -879,8 +914,49 @@ class DataProcessor:
                 self.total_power_w = int(jget(116, 0))
             except Exception:
                 self.total_power_w = 0
+            self.publish("info/totalPower", self.total_power_w)
+        # Dispatch 447 switch group details if present
+        if "447" in data:
+            await self.process_switch_group_details(data["447"])
 
     # -------- Historic parsing --------
+
+    def _publish_period_entries(self, entries: list[Any], period: str) -> None:
+        """Publish yield/cons/selfcons for each entry. period is 'monthly' or 'yearly'."""
+        for entry in entries:
+            if len(entry) >= 4 and entry[1]:
+                date_str = entry[0]
+                year = date_str[-2:]
+                if period == "monthly":
+                    month = date_str[3:5]
+                    self.publish(f"Historic/20{year}/monthly/{month}/yieldmonth", entry[1])
+                    self.publish(f"Historic/20{year}/monthly/{month}/consmonth", entry[2])
+                    self.publish(f"Historic/20{year}/monthly/{month}/selfconsmonth", entry[3])
+                else:
+                    self.publish(f"Historic/20{year}/yieldyear", entry[1])
+                    self.publish(f"Historic/20{year}/consyear", entry[2])
+                    self.publish(f"Historic/20{year}/selfconsyear", entry[3])
+
+    def _publish_selfcons_pair(
+        self,
+        current_entry: list[Any],
+        last_entry: list[Any],
+        current_topic: str,
+        ratio_topic: str,
+        last_topic: str,
+        last_ratio_topic: str,
+    ) -> None:
+        """Publish selfcons value + ratio for a current/last period pair."""
+        if len(current_entry) >= 4:
+            self.publish(current_topic, int(current_entry[3]))
+            cons = current_entry[2] or 0
+            if cons > 0:
+                self.publish(ratio_topic, self._selfcons_ratio_kwh(current_entry[3], cons))
+        if len(last_entry) >= 4:
+            self.publish(last_topic, int(last_entry[3]))
+            cons_last = last_entry[2] or 0
+            if cons_last > 0:
+                self.publish(last_ratio_topic, self._selfcons_ratio_kwh(last_entry[3], cons_last))
 
     async def process_historic_response(
         self, req_data: str, data: dict[str, Any]
@@ -911,45 +987,12 @@ class DataProcessor:
                     "Processing monthly totals (877): %s entries", len(data_month_tot)
                 )
                 if len(data_month_tot) >= 2:
-                    current_month = data_month_tot[-1]
-                    if len(current_month) >= 4:
-                        self.publish("SelfCons/selfconsmonth", int(current_month[3]))
-                        cons = current_month[2] or 0
-                        if cons > 0:
-                            monthly_ratio = (
-                                round(((current_month[3] * 1000) / cons) * 1000) / 10
-                            )
-                            self.publish("SelfCons/selfconsratiomonth", monthly_ratio)
-                    if len(data_month_tot) >= 2:
-                        last_month = data_month_tot[-2]
-                        if len(last_month) >= 4:
-                            self.publish(
-                                "SelfCons/selfconslastmonth", int(last_month[3])
-                            )
-                            cons_last = last_month[2] or 0
-                            if cons_last > 0:
-                                last_monthly_ratio = (
-                                    round(((last_month[3] * 1000) / cons_last) * 1000)
-                                    / 10
-                                )
-                                self.publish(
-                                    "SelfCons/selfconsratiolastmonth",
-                                    last_monthly_ratio,
-                                )
-                for entry in data_month_tot:
-                    if len(entry) >= 4 and entry[1]:
-                        date_str = entry[0]
-                        year = date_str[-2:]
-                        month = date_str[3:5]
-                        self.publish(
-                            f"Historic/20{year}/monthly/{month}/yieldmonth", entry[1]
-                        )
-                        self.publish(
-                            f"Historic/20{year}/monthly/{month}/consmonth", entry[2]
-                        )
-                        self.publish(
-                            f"Historic/20{year}/monthly/{month}/selfconsmonth", entry[3]
-                        )
+                    self._publish_selfcons_pair(
+                        data_month_tot[-1], data_month_tot[-2],
+                        "SelfCons/selfconsmonth", "SelfCons/selfconsratiomonth",
+                        "SelfCons/selfconslastmonth", "SelfCons/selfconsratiolastmonth",
+                    )
+                self._publish_period_entries(data_month_tot, "monthly")
             # 878: yearly totals and self-cons metrics
             if "878" in data:
                 data_year_tot = data["878"]
@@ -957,33 +1000,12 @@ class DataProcessor:
                     "Processing yearly totals (878): %s entries", len(data_year_tot)
                 )
                 if len(data_year_tot) >= 2:
-                    current_year = data_year_tot[-1]
-                    if len(current_year) >= 4:
-                        self.publish("SelfCons/selfconsyear", int(current_year[3]))
-                        cons_y = current_year[2] or 0
-                        if cons_y > 0:
-                            yearly_ratio = (
-                                round(((current_year[3] * 1000) / cons_y) * 1000) / 10
-                            )
-                            self.publish("SelfCons/selfconsratioyear", yearly_ratio)
-                    if len(data_year_tot) >= 2:
-                        last_year = data_year_tot[-2]
-                        if len(last_year) >= 4:
-                            self.publish("SelfCons/selfconslastyear", int(last_year[3]))
-                            cons_yl = last_year[2] or 0
-                            if cons_yl > 0:
-                                last_yearly_ratio = (
-                                    round(((last_year[3] * 1000) / cons_yl) * 1000) / 10
-                                )
-                                self.publish(
-                                    "SelfCons/selfconsratiolastyear", last_yearly_ratio
-                                )
-                for entry in data_year_tot:
-                    if len(entry) >= 4 and entry[1]:
-                        year = entry[0][-2:]
-                        self.publish(f"Historic/20{year}/yieldyear", entry[1])
-                        self.publish(f"Historic/20{year}/consyear", entry[2])
-                        self.publish(f"Historic/20{year}/selfconsyear", entry[3])
+                    self._publish_selfcons_pair(
+                        data_year_tot[-1], data_year_tot[-2],
+                        "SelfCons/selfconsyear", "SelfCons/selfconsratioyear",
+                        "SelfCons/selfconslastyear", "SelfCons/selfconsratiolastyear",
+                    )
+                self._publish_period_entries(data_year_tot, "yearly")
         except Exception:
             logging.exception("Historic data processing error")
 
@@ -991,46 +1013,13 @@ class DataProcessor:
         """Process /months.json payload for monthly historic and ratios."""
         try:
             logging.debug("Processing monthly JSON data: %s entries", len(data))
-            for entry in data:
-                if len(entry) >= 4:
-                    date_str = entry[0]
-                    year = date_str[-2:]
-                    month = date_str[3:5]
-                    if entry[1]:
-                        self.publish(
-                            f"Historic/20{year}/monthly/{month}/yieldmonth", entry[1]
-                        )
-                        self.publish(
-                            f"Historic/20{year}/monthly/{month}/consmonth", entry[2]
-                        )
-                        self.publish(
-                            f"Historic/20{year}/monthly/{month}/selfconsmonth", entry[3]
-                        )
+            self._publish_period_entries(data, "monthly")
             if len(data) >= 2:
-                current_month_json = data[0]
-                if len(current_month_json) >= 4:
-                    selfcons_month = int(current_month_json[3])
-                    self.publish("SelfCons/selfconsmonth", selfcons_month)
-                    cons = current_month_json[2] or 0
-                    if cons > 0:
-                        ratio_month = (
-                            round(((current_month_json[3] * 1000) / cons) * 1000) / 10
-                        )
-                        self.publish("SelfCons/selfconsratiomonth", ratio_month)
-                if len(data) > 1:
-                    last_month_json = data[1]
-                    if len(last_month_json) >= 4:
-                        selfcons_lastmonth = int(last_month_json[3])
-                        self.publish("SelfCons/selfconslastmonth", selfcons_lastmonth)
-                        cons_last = last_month_json[2] or 0
-                        if cons_last > 0:
-                            ratio_lastmonth = (
-                                round(((last_month_json[3] * 1000) / cons_last) * 1000)
-                                / 10
-                            )
-                            self.publish(
-                                "SelfCons/selfconsratiolastmonth", ratio_lastmonth
-                            )
+                self._publish_selfcons_pair(
+                    data[0], data[1],
+                    "SelfCons/selfconsmonth", "SelfCons/selfconsratiomonth",
+                    "SelfCons/selfconslastmonth", "SelfCons/selfconsratiolastmonth",
+                )
         except Exception:
             logging.exception("Monthly JSON data processing error")
 
@@ -1038,38 +1027,12 @@ class DataProcessor:
         """Process /years.json payload for yearly historic and ratios."""
         try:
             logging.debug("Processing yearly JSON data: %s entries", len(data))
-            for entry in data:
-                if len(entry) >= 4:
-                    date_str = entry[0]
-                    year = date_str[-2:]
-                    if entry[1]:
-                        self.publish(f"Historic/20{year}/yieldyear", entry[1])
-                        self.publish(f"Historic/20{year}/consyear", entry[2])
-                        self.publish(f"Historic/20{year}/selfconsyear", entry[3])
+            self._publish_period_entries(data, "yearly")
             if len(data) >= 2:
-                current_year_json = data[0]
-                if len(current_year_json) >= 4:
-                    selfcons_year = int(current_year_json[3])
-                    self.publish("SelfCons/selfconsyear", selfcons_year)
-                    cons_y = current_year_json[2] or 0
-                    if cons_y > 0:
-                        ratio_year = (
-                            round(((current_year_json[3] * 1000) / cons_y) * 1000) / 10
-                        )
-                        self.publish("SelfCons/selfconsratioyear", ratio_year)
-                if len(data) > 1:
-                    last_year_json = data[1]
-                    if len(last_year_json) >= 4:
-                        selfcons_lastyear = int(last_year_json[3])
-                        self.publish("SelfCons/selfconslastyear", selfcons_lastyear)
-                        cons_yl = last_year_json[2] or 0
-                        if cons_yl > 0:
-                            ratio_lastyear = (
-                                round(((last_year_json[3] * 1000) / cons_yl) * 1000)
-                                / 10
-                            )
-                            self.publish(
-                                "SelfCons/selfconsratiolastyear", ratio_lastyear
-                            )
+                self._publish_selfcons_pair(
+                    data[0], data[1],
+                    "SelfCons/selfconsyear", "SelfCons/selfconsratioyear",
+                    "SelfCons/selfconslastyear", "SelfCons/selfconsratiolastyear",
+                )
         except Exception:
             logging.exception("Yearly JSON data processing error")

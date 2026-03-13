@@ -9,6 +9,8 @@ import logging
 from datetime import datetime, timedelta
 from typing import Callable, Protocol
 
+import iot_daemonize
+
 from .constants import HTTP_TIMEOUT_SECONDS
 
 
@@ -87,14 +89,10 @@ async def get_forecast_data(
         logging.exception("Forecast API request error")
 
 
-async def health_check(mqtt_publisher, solar_log_client, publish_fn: PublishFn) -> bool:
+async def health_check(solar_log_client, publish_fn: PublishFn) -> bool:
     try:
         health_status = {
-            "mqtt_connected": (
-                mqtt_publisher and mqtt_publisher.is_connected()
-                if mqtt_publisher
-                else False
-            ),
+            "mqtt_connected": iot_daemonize.mqtt_client is not None,
             "solar_client_active": bool(
                 solar_log_client
                 and solar_log_client.session

@@ -23,7 +23,6 @@ from .core.constants import (
     HISTORIC_DATA,
 )
 from .core.config_schema import validate_config
-from .core.mqtt_publisher import MQTTPublisher
 from .core.data_processor import DataProcessor
 from .core.exceptions import AccessDeniedError
 from .core.orchestrator import (
@@ -36,7 +35,6 @@ config = None
 
 # Global instances
 solar_log_client: Optional[SolarLogClient] = None
-mqtt_publisher: Optional[MQTTPublisher] = None
 data_processor: Optional[DataProcessor] = None
 
 
@@ -353,7 +351,7 @@ async def forecast_polling_loop(stop):
             while not stop():
                 last_power = data_processor.total_power_w if data_processor else None
                 await orchestrator_get_forecast_data(
-                    config, solar_log_client, mqtt_publisher.publish, total_power_w=last_power
+                    config, solar_log_client, data_processor.publish, total_power_w=last_power
                 )
 
                 now = datetime.now()
@@ -371,7 +369,7 @@ async def forecast_polling_loop(stop):
 async def health_check_loop(stop):
     while not stop():
         try:
-            await orchestrator_health_check(mqtt_publisher, solar_log_client, mqtt_publisher.publish)
+            await orchestrator_health_check(solar_log_client, data_processor.publish)
             await asyncio.sleep(config.health_check_interval)
         except Exception:
             logging.exception("health_check_loop error")
@@ -383,9 +381,9 @@ async def health_check_loop(stop):
 async def restart_bridge(reason):
     try:
         logging.warning("Bridge restart initiated due to: {}".format(reason))
-        if mqtt_publisher:
-            mqtt_publisher.publish('info/connection', False)
-            mqtt_publisher.publish('info/restart_reason', reason)
+        if data_processor:
+            data_processor.publish('info/connection', False)
+            data_processor.publish('info/restart_reason', reason)
 
         restart_delay = getattr(config, 'restart_delay', DEFAULT_RESTART_DELAY)
         logging.info("Waiting {} seconds before restart...".format(restart_delay))
@@ -403,7 +401,7 @@ async def restart_bridge(reason):
 
 
 async def start_solarlog_bridge(stop):
-    global solar_log_client, mqtt_publisher, data_processor
+    global solar_log_client, data_processor
     try:
         logging.info("Starting SolarLog2MQTT bridge")
 
@@ -420,13 +418,8 @@ async def start_solarlog_bridge(stop):
         if solar_log_client.user_pass:
             await solar_log_client.login()
 
-        # Initialize MQTT Publisher (connection handled by iot_daemonize framework)
-        mqtt_publisher = MQTTPublisher(
-            base_topic=config.mqtt_topic,
-        )
-
-        # Initialize DataProcessor
-        data_processor = DataProcessor(mqtt_publisher)
+        # Initialize DataProcessor (publishes directly via iot_daemonize.mqtt_client)
+        data_processor = DataProcessor(base_topic=config.mqtt_topic)
 
         # Start data polling and await until loops are stopped
         await start_polling(stop)

@@ -6,10 +6,13 @@ handling, and publishes values via the provided MQTT publisher.
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import Any
 import logging
 import math
 from datetime import datetime, timedelta
+
+import iot_daemonize
+
 from .api_validation import as_dict
 from .constants import (
     MAX_SWITCH_GROUPS,
@@ -20,15 +23,12 @@ from .constants import (
 )
 from .exceptions import AccessDeniedError
 
-if TYPE_CHECKING:  # Avoid runtime import cycle during initial skeleton stage
-    from .mqtt_publisher import MQTTPublisher
-
 
 class DataProcessor:
     """Handles processing of Solar-Log device data and publishing to MQTT."""
 
-    def __init__(self, mqtt_publisher: "MQTTPublisher | None" = None) -> None:
-        self.mqtt_publisher = mqtt_publisher
+    def __init__(self, base_topic: str = "solarlog") -> None:
+        self.base_topic = base_topic.rstrip('/')
         # Device state
         self.num_inverters = 0
         self.inverter_names: list[str] = []
@@ -70,13 +70,17 @@ class DataProcessor:
         return round(((selfcons_kwh * 1000) / consumption_wh) * 1000) / 10
 
     def publish(self, topic: str, value: str | int | float | bool) -> None:
-        """Publish a value to MQTT via the configured publisher.
-
-        This method is intentionally lenient and returns silently if no
-        publisher is configured to ease testing without a broker.
-        """
-        if self.mqtt_publisher:
-            self.mqtt_publisher.publish(topic, value)
+        """Publish a value to MQTT via iot_daemonize.mqtt_client."""
+        if iot_daemonize.mqtt_client is None:
+            return
+        try:
+            full_topic = f"{self.base_topic}/{topic}"
+            logging.debug(
+                "Publishing to MQTT - Topic: %s, Value: %s", full_topic, value
+            )
+            iot_daemonize.mqtt_client.publish(full_topic, str(value))
+        except Exception:
+            logging.exception("MQTT publish error")
 
     async def process_response(self, req_data: str, data: Any) -> None:
         """Unified dispatcher for all Solar-Log response types."""

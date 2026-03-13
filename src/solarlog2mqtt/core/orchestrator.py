@@ -7,15 +7,11 @@ import aiohttp
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Callable, Protocol
 
 import iot_daemonize
 
+from .api_validation import PublishFn
 from .constants import HTTP_TIMEOUT_SECONDS
-
-
-class PublishFn(Protocol):
-    def __call__(self, topic: str, value: int | float | bool | str) -> None: ...
 
 
 async def _process_forecast_response(

@@ -1,27 +1,28 @@
 """Solar-Log data processing (Python 3.12).
 
-Implements startup, fast/periodic polling, historic parsing, and switch-group
-handling, and publishes values via the provided MQTT publisher.
+Implements startup, fast/periodic polling, and publishes values via the
+provided MQTT publisher.  Device registry and historic processing are
+delegated to dedicated modules.
 """
 
 from __future__ import annotations
 
 from typing import Any
 import logging
-import math
 from datetime import datetime, timedelta
 
 import iot_daemonize
 
-from .api_validation import as_dict
+from .api_validation import as_dict, safe_get
 from .constants import (
     MAX_SWITCH_GROUPS,
-    MAX_DEVICES_DISCOVERY,
     DEFAULT_SETPOINT_DAILY_DIVISOR,
-    DEVICE_CLASS_LIST,
     DAYS_TO_CHECK_HISTORY,
 )
+from .device_registry import DeviceRegistry
 from .exceptions import AccessDeniedError
+from .historic_processor import HistoricProcessor
+from .request_types import RequestType, classify_request
 
 
 class DataProcessor:
@@ -29,21 +30,7 @@ class DataProcessor:
 
     def __init__(self, base_topic: str = "solarlog") -> None:
         self.base_topic = base_topic.rstrip('/')
-        # Device state
-        self.num_inverters = 0
-        self.inverter_names: list[str] = []
-        self.device_infos: list[int] = []
-        self.device_types: list[str] = []
-        self.device_brands: list[str] = []
-        self.device_classes: list[str] = []
-        self.switch_group_names: list[str | None] = []
-        self.num_switch_groups = 0
-        self.battery_device_present = False
-        self.battery_index: list[int] = []
-        self.device_list: dict[str, Any] | None = None
-        self.brand_list: dict[str, Any] | None = None
-        self.solar_log_model: int | None = None
-        self.battery_present = False
+        self.devices = DeviceRegistry()
 
         # Track latest daily production figures for ratio calculations
         self.last_yield_day = 0
@@ -55,19 +42,39 @@ class DataProcessor:
         # Last known total power (W) for forecast helper
         self.total_power_w: int = 0
 
+        # Sub-processors
+        self.historic = HistoricProcessor(self.publish, self.devices)
+
+    # --- Convenience accessors for bridge/orchestrator compatibility ---
+
+    @property
+    def num_inverters(self) -> int:
+        return self.devices.num_inverters
+
+    @property
+    def inverter_names(self) -> list[str]:
+        return self.devices.inverter_names
+
+    @property
+    def device_list(self) -> dict[str, Any] | None:
+        return self.devices.device_list
+
+    @property
+    def brand_list(self) -> dict[str, Any] | None:
+        return self.devices.brand_list
+
+    @property
+    def solar_log_model(self) -> int | None:
+        return self.devices.solar_log_model
+
     @staticmethod
-    def _selfcons_ratio(selfcons: int | float, total: int | float) -> float:
+    def _selfcons_ratio(
+        selfcons: int | float, total: int | float, *, unit_factor: float = 1.0
+    ) -> float:
         """Self-consumption as percentage with 1 decimal. Returns 0 if total <= 0."""
         if total <= 0:
             return 0
-        return round((selfcons / total) * 1000) / 10
-
-    @staticmethod
-    def _selfcons_ratio_kwh(selfcons_kwh: int | float, consumption_wh: int | float) -> float:
-        """Self-consumption ratio for kWh selfcons vs Wh consumption. Returns 0 if consumption <= 0."""
-        if consumption_wh <= 0:
-            return 0
-        return round(((selfcons_kwh * 1000) / consumption_wh) * 1000) / 10
+        return round(((selfcons * unit_factor) / total) * 1000) / 10
 
     def publish(self, topic: str, value: str | int | float | bool) -> None:
         """Publish a value to MQTT via iot_daemonize.mqtt_client."""
@@ -85,23 +92,24 @@ class DataProcessor:
     async def process_response(self, req_data: str, data: Any) -> None:
         """Unified dispatcher for all Solar-Log response types."""
         logging.debug("Processing data for request: %s...", req_data[:10])
-        if req_data.startswith('/months.json'):
-            await self.process_months_json(data)
-        elif req_data.startswith('/years.json'):
-            await self.process_years_json(data)
-        elif req_data.startswith('{"152"'):
-            await self.process_startup_data(data)
-        elif req_data.startswith('{"141"'):
-            await self.process_device_info(data)
-        elif req_data.startswith('{"447"'):
-            await self.process_periodic_poll(data)
-        elif req_data.startswith('{"608"'):
-            await self.process_fast_poll(data)
-        elif req_data.startswith('{"801"'):
-            if '801' in data and isinstance(data.get('801'), dict) and '170' in data['801']:
+        match classify_request(req_data):
+            case RequestType.MONTHS_JSON:
+                await self.historic.process_months_json(data)
+            case RequestType.YEARS_JSON:
+                await self.historic.process_years_json(data)
+            case RequestType.STARTUP:
+                await self.process_startup_data(data)
+            case RequestType.DEVICE_INFO:
+                await self.process_device_info(data)
+            case RequestType.PERIODIC_POLL:
                 await self.process_periodic_poll(data)
-        elif req_data.startswith('{"854"'):
-            await self.process_historic_response(req_data, data)
+            case RequestType.FAST_POLL:
+                await self.process_fast_poll(data)
+            case RequestType.SIMPLE_POLL:
+                if '801' in data and isinstance(data.get('801'), dict) and '170' in data['801']:
+                    await self.process_periodic_poll(data)
+            case RequestType.HISTORIC:
+                await self.historic.process_historic_response(req_data, data)
 
     async def process_device_info(self, data: dict[str, Any]) -> None:
         """Process device info response (block 141) — inverter names and info codes."""
@@ -112,8 +120,8 @@ class DataProcessor:
 
             device_data = data['141']
 
-            if self.num_inverters > 0:
-                indices = list(range(self.num_inverters))
+            if self.devices.num_inverters > 0:
+                indices = list(range(self.devices.num_inverters))
             else:
                 indices_set: set[int] = set()
                 for k in device_data.keys():
@@ -124,8 +132,8 @@ class DataProcessor:
                 indices = sorted(indices_set)
                 num_detected = len(indices)
                 if num_detected > 0:
-                    self.num_inverters = num_detected
-                    self.publish('info/numinv', max(self.num_inverters - 1, 0))
+                    self.devices.num_inverters = num_detected
+                    self.publish('info/numinv', max(self.devices.num_inverters - 1, 0))
 
             inv_names: list[str] = []
             infos: list[int] = []
@@ -142,33 +150,28 @@ class DataProcessor:
 
             logging.info("Discovered %s devices: %s", len(inv_names), inv_names)
 
-            self.inverter_names = inv_names.copy()
-            self.device_infos = infos.copy()
+            self.devices.inverter_names = inv_names.copy()
+            self.devices.device_infos = infos.copy()
 
-            await self.classify_devices()
+            await self.devices.classify_devices()
             await self.publish_device_info()
 
         except Exception:
             logging.exception("process_device_info error")
 
     async def process_startup_data(self, data: dict[str, Any]) -> None:
-        """Process startup data and extract device information.
-
-        Publishes device/system metadata, SD card info, switch groups, and
-        computed setpoints where available. Stores discovery metadata for
-        later classification and runtime processing.
-        """
+        """Process startup data and extract device information."""
         try:
             logging.debug("Startup data keys: %s", list(data.keys()))
 
-            # Process different aspects of startup data
             await self._process_device_system_info(data)
             await self._process_sd_card_info(data)
-            await self._process_device_discovery(data)
-            await self._process_switch_groups(data)
-            await self._process_battery_info(data)
+            await self.devices.process_device_discovery(data)
+            # publish numinv after discovery
+            self.publish("info/numinv", max(self.devices.num_inverters - 1, 0))
+            await self.devices.process_switch_groups(data)
+            await self.devices.process_battery_info(data)
 
-            # Process setpoint data if available
             if "152" in data and "161" in data and "162" in data:
                 try:
                     await self._process_setpoint_data(
@@ -184,131 +187,13 @@ class DataProcessor:
         except Exception:
             logging.exception("Startup data processing error")
 
-    @staticmethod
-    def _get_indexed(container: Any, idx: Any) -> Any:
-        """Retrieve item from a list or dict by numeric or string key."""
-        if container is None:
-            return None
-        if isinstance(container, list):
-            return container[idx] if 0 <= idx < len(container) else None
-        if isinstance(container, dict):
-            if idx in container:
-                return container[idx]
-            return container.get(str(idx))
-        return None
-
-    def _classify_single_device(self, i: int, name: str, info_code: int) -> tuple[str, str, str, bool]:
-        """Classify one device. Returns (type, brand, class, is_battery)."""
-        try:
-            info_idx = int(info_code)
-        except Exception:
-            info_idx = info_code
-
-        device_info = self._get_indexed(self.device_list, info_idx)
-        logging.debug("device_list[%s] = %s", info_code, device_info)
-
-        if not device_info:
-            logging.debug("No device_info for index %s", info_idx)
-            return "Unknown", "Unknown", "Wechselrichter", False
-
-        # Device type (index 1)
-        device_type = (
-            device_info[1]
-            if isinstance(device_info, (list, tuple)) and len(device_info) > 1
-            else "Unknown"
-        )
-
-        # Brand via brand_list[device_info[0]]
-        brand_idx_val = (
-            device_info[0]
-            if isinstance(device_info, (list, tuple)) and len(device_info) > 0
-            else 0
-        )
-        try:
-            brand_idx_int = int(brand_idx_val)
-        except Exception:
-            brand_idx_int = brand_idx_val
-        device_brand = self._get_indexed(self.brand_list, brand_idx_int) or "Unknown"
-
-        # Device class from bitmask at index 5
-        device_class = "Wechselrichter"
-        if isinstance(device_info, (list, tuple)) and len(device_info) > 5:
-            try:
-                dclass_val = int(device_info[5])
-            except Exception:
-                dclass_val = 0
-            if dclass_val > 0:
-                class_idx = int(math.log2(dclass_val))
-                if 0 <= class_idx < len(DEVICE_CLASS_LIST):
-                    device_class = DEVICE_CLASS_LIST[class_idx]
-
-        is_battery = device_class == "Batterie"
-        if is_battery:
-            logging.info("Battery device detected at index %s: %s", i, name)
-
-        logging.debug(
-            "Device %s (%s): Type=%s, Brand=%s, Class=%s",
-            i, name, device_type, device_brand, device_class,
-        )
-        return device_type, device_brand, device_class, is_battery
-
-    async def classify_devices(self) -> None:
-        """Classify devices using discovered lists and populate device metadata."""
-        try:
-            logging.debug(
-                "Classifying devices - device_list available: %s, brand_list available: %s, device_infos len: %s",
-                self.device_list is not None,
-                self.brand_list is not None,
-                len(self.device_infos),
-            )
-            if not self.device_list or not self.brand_list or not self.device_infos:
-                logging.warning(
-                    "Device classification data not available, using placeholders"
-                )
-                self.device_types = ["Unknown"] * len(self.inverter_names)
-                self.device_brands = ["Unknown"] * len(self.inverter_names)
-                self.device_classes = ["Wechselrichter"] * len(self.inverter_names)
-                return
-
-            device_types: list[str] = []
-            device_brands: list[str] = []
-            device_classes: list[str] = []
-            battery_index: list[int] = []
-
-            for i, (name, info_code) in enumerate(
-                zip(self.inverter_names, self.device_infos)
-            ):
-                dtype, brand, dclass, is_batt = self._classify_single_device(i, name, info_code)
-                device_types.append(dtype)
-                device_brands.append(brand)
-                device_classes.append(dclass)
-                if is_batt:
-                    battery_index.append(i)
-
-            logging.info(
-                "Device classification complete. Battery devices: %s (indices: %s)",
-                bool(battery_index),
-                battery_index,
-            )
-            self.device_types = device_types
-            self.device_brands = device_brands
-            self.device_classes = device_classes
-            self.battery_device_present = bool(battery_index)
-            self.battery_index = battery_index
-
-        except Exception:
-            logging.exception("Device classification failed; using defaults")
-            self.device_types = ["Unknown"] * len(self.inverter_names)
-            self.device_brands = ["Unknown"] * len(self.inverter_names)
-            self.device_classes = ["Wechselrichter"] * len(self.inverter_names)
-
     async def publish_device_info(self) -> None:
         """Publish per-device metadata (class/type/brand) to MQTT."""
         try:
-            inv_names = self.inverter_names
-            types = self.device_types
-            brands = self.device_brands
-            classes = self.device_classes
+            inv_names = self.devices.inverter_names
+            types = self.devices.device_types
+            brands = self.devices.device_brands
+            classes = self.devices.device_classes
             logging.debug("Publishing device info for %s devices", len(inv_names))
             logging.debug("Device names: %s", inv_names)
             logging.debug("Device types: %s", types)
@@ -339,9 +224,9 @@ class DataProcessor:
             self.publish("info/SN", data["706"])
         block_800 = as_dict(data.get("800"), ctx="800")
         if block_800 and "100" in block_800:
-            self.solar_log_model = int(block_800["100"])  # type: ignore[arg-type]
-            self.publish("info/Model", str(self.solar_log_model))
-            logging.info("Detected Solar Log model: %s", self.solar_log_model)
+            self.devices.solar_log_model = int(block_800["100"])  # type: ignore[arg-type]
+            self.publish("info/Model", str(self.devices.solar_log_model))
+            logging.info("Detected Solar Log model: %s", self.devices.solar_log_model)
         if block_800 and "160" in block_800:
             self.publish("info/InstDate", block_800["160"])  # type: ignore[index]
 
@@ -361,76 +246,6 @@ class DataProcessor:
                     f" - {sdinfo.get(104, '')}/{sdinfo.get(105, '')}"
                 )
                 self.publish("info/SD", sd_formatted)
-
-    async def _process_device_discovery(self, data: dict[str, Any]) -> None:
-        """Count inverters/meters based on discovery table 740 and publish size."""
-        if "739" in data:
-            self.device_list = data["739"]
-            logging.debug("Device list: %s", self.device_list)
-        if "744" in data:
-            self.brand_list = data["744"]
-            logging.debug("Brand list: %s", self.brand_list)
-
-        logging.debug("About to process '740' data...")
-        try:
-            if "740" in data:
-                data_740 = as_dict(data.get("740"), ctx="740") or {}
-                logging.debug("Device discovery data (740): %s", data_740)
-
-                numinv = 0
-                statusuz = ""
-                while statusuz != "Err" and numinv < 100:
-                    statusuz = data_740.get(str(numinv), "Err")  # type: ignore[assignment]
-                    logging.debug("Checking device %s: status = %s", numinv, statusuz)
-                    if statusuz != "Err":
-                        numinv += 1
-                    else:
-                        break
-
-                self.num_inverters = numinv
-                logging.info("Number of inverters/meters: %s", self.num_inverters)
-                # JS publishes info.numinv as (numinv - 1)
-                self.publish("info/numinv", max(self.num_inverters - 1, 0))
-            else:
-                logging.warning("No '740' data found in startup response")
-                self.num_inverters = 0
-
-            # Requesting device info is handled by orchestrator (startup sequence).
-
-        except Exception:
-            logging.exception("Error in device discovery")
-            self.num_inverters = 0
-
-    async def _process_switch_groups(self, data: dict[str, Any]) -> None:
-        """Extract switch group names and publish their count."""
-        if "447" in data:
-            sgdata = as_dict(data.get("447"), ctx="447") or {}
-            logging.debug("Switch group data: %s", sgdata)
-
-            self.switch_group_names = []
-            for isg in range(MAX_SWITCH_GROUPS):
-                try:
-                    entry = sgdata.get(isg)  # type: ignore[index]
-                    sg_name = entry.get(100) if isinstance(entry, dict) else None
-                    if sg_name:
-                        clean_name = sg_name.replace(" ", "")
-                        self.switch_group_names.append(clean_name)
-                        logging.debug("Found switch group: %s", clean_name)
-                    else:
-                        self.switch_group_names.append(None)
-                except Exception:
-                    self.switch_group_names.append(None)
-
-            self.num_switch_groups = len(
-                [name for name in self.switch_group_names if name]
-            )
-            logging.info("Number of switch groups: %s", self.num_switch_groups)
-
-    async def _process_battery_info(self, data: dict[str, Any]) -> None:
-        """Detect presence of a battery device from startup payload."""
-        if "858" in data and data["858"]:
-            self.battery_present = len(data["858"]) > 0
-            logging.info("Battery detected: %s", self.battery_present)
 
     async def _process_setpoint_data(
         self, data_152: Any, data_161: Any, data_162: Any
@@ -456,7 +271,6 @@ class DataProcessor:
             )
             self.publish("forecast/setpointYear", int(setpoint_year))
 
-            # Process monthly setpoints from data_152 array
             if isinstance(data_152, list) and len(data_152) >= 12:
                 current_month = datetime.now().month
 
@@ -490,8 +304,8 @@ class DataProcessor:
 
     async def process_inverter_status(self, data: dict[str, Any]) -> None:
         """Publish per-inverter status and PAC from fast poll tables 608/782."""
-        inv_names = self.inverter_names
-        classes = self.device_classes
+        inv_names = self.devices.inverter_names
+        classes = self.devices.device_classes
         if "608" in data and "782" in data and inv_names:
             status_data = data["608"]
             pac_data = data["782"]
@@ -502,27 +316,15 @@ class DataProcessor:
             for idx in range(len(inv_names)):
                 if idx < len(classes) and classes[idx] != "Batterie":
                     inverter_name = inv_names[idx]
-                    # Status
-                    if isinstance(status_data, list):
-                        status = (
-                            status_data[idx] if idx < len(status_data) else "Unknown"
-                        )
-                    else:
-                        status = status_data.get(
-                            str(idx), status_data.get(idx, "Unknown")
-                        )
+                    status = safe_get(status_data, idx, "Unknown")
                     self.publish(f"INV/{inverter_name}/status", status)
-                    # PAC
-                    if isinstance(pac_data, list):
-                        pac_value = pac_data[idx] if idx < len(pac_data) else 0
-                    else:
-                        pac_value = pac_data.get(str(idx), pac_data.get(idx, 0))
+                    pac_value = safe_get(pac_data, idx, 0)
                     pac = int(pac_value) if pac_value else 0
                     self.publish(f"INV/{inverter_name}/PAC", pac)
 
     async def process_inverter_extras(self, data: dict[str, Any]) -> None:
         """Publish optional per-inverter extras if present (e.g., UAC/UDC arrays)."""
-        inv_names = self.inverter_names
+        inv_names = self.devices.inverter_names
         if not inv_names:
             return
         extras: list[tuple[str, str]] = [
@@ -537,23 +339,15 @@ class DataProcessor:
                 )
                 for idx, name in enumerate(inv_names):
                     try:
-                        val = 0
-                        if isinstance(arr, list):
-                            val = (
-                                int(arr[idx])
-                                if idx < len(arr) and arr[idx] is not None
-                                else 0
-                            )
-                        elif isinstance(arr, dict):
-                            raw = arr.get(idx, arr.get(str(idx)))
-                            val = int(raw) if raw is not None else 0
+                        raw = safe_get(arr, idx)
+                        val = int(raw) if raw is not None else 0
                         self.publish(f"INV/{name}/{suffix}", val)
                     except Exception:
                         continue
 
     async def process_switch_group_states(self, data: dict[str, Any]) -> None:
         """Publish switch group state from 801/175."""
-        sg_names = self.switch_group_names
+        sg_names = self.devices.switch_group_names
         block_801 = data.get("801") if isinstance(data, dict) else None
         if isinstance(block_801, dict) and "175" in block_801 and sg_names:
             sg_data = block_801["175"]
@@ -575,10 +369,10 @@ class DataProcessor:
 
     async def process_battery_data(self, data: dict[str, Any]) -> list[int]:
         """Return battery data array and publish selected metrics by inverter."""
-        is_battery_present = self.battery_present
-        is_battery_device_present = self.battery_device_present
-        batt_index = self.battery_index
-        inv_names = self.inverter_names
+        is_battery_present = self.devices.battery_present
+        is_battery_device_present = self.devices.battery_device_present
+        batt_index = self.devices.battery_index
+        inv_names = self.devices.inverter_names
 
         battery_data = [0, 0, 0, 0]
         if "858" in data:
@@ -649,7 +443,6 @@ class DataProcessor:
 
     async def process_fast_poll(self, data: dict[str, Any]) -> None:
         """Orchestrate processing of fast-poll payloads."""
-        # Check for access denied before processing
         if '608' in data and data['608']:
             first_status = None
             if isinstance(data['608'], list) and len(data['608']) > 0:
@@ -659,7 +452,6 @@ class DataProcessor:
             if first_status is not None and "DENIED" in str(first_status):
                 raise AccessDeniedError("Solar Log access denied")
         logging.debug("Fast poll data keys: %s", list(data.keys()))
-        # Diagnostic: unknown fast-poll keys
         known_fast = {"608", "780", "781", "782", "794", "801", "858"}
         extra_fast = {str(k) for k in data.keys()} - known_fast
         if extra_fast:
@@ -680,34 +472,32 @@ class DataProcessor:
     ) -> None:
         """Process detailed switch group data (447) and publish metadata."""
         try:
-            sg_names = self.switch_group_names
+            sg_names = self.devices.switch_group_names
             if not sg_names:
                 return
             for sgj in range(min(MAX_SWITCH_GROUPS, len(sg_names))):
                 sg_name = sg_names[sgj]
                 if sg_name and sgj < len(sg_data) and sg_data[sgj]:
                     try:
-                        # Switch group mode (102)
                         if isinstance(sg_data[sgj], dict):
                             mode = sg_data[sgj].get("102", sg_data[sgj].get(102))
                         else:
                             mode = None
                         self.publish(f"SwitchGroup/{sg_name}/mode", mode)
 
-                        # Linked device info (101.0.100 and 101.0.101)
                         linked_list = None
                         if isinstance(sg_data[sgj], dict):
                             linked_list = sg_data[sgj].get("101", sg_data[sgj].get(101))
                         if isinstance(linked_list, list) and len(linked_list) > 0:
                             linked_device_data = linked_list[0]
-                            if self.inverter_names:
+                            if self.devices.inverter_names:
                                 device_idx = linked_device_data.get(
                                     "100", linked_device_data.get(100)
                                 )
                                 if isinstance(device_idx, int) and device_idx < len(
-                                    self.inverter_names
+                                    self.devices.inverter_names
                                 ):
-                                    linked_device_name = self.inverter_names[device_idx]
+                                    linked_device_name = self.devices.inverter_names[device_idx]
                                     self.publish(
                                         f"SwitchGroup/{sg_name}/linkeddev",
                                         linked_device_name,
@@ -728,8 +518,8 @@ class DataProcessor:
     async def process_inverter_day_sums(self, data_suz: list[Any]) -> None:
         """Publish per-inverter day sums from 777/0."""
         try:
-            inv_names = self.inverter_names
-            classes = self.device_classes
+            inv_names = self.devices.inverter_names
+            classes = self.devices.device_classes
             if not inv_names or not classes:
                 logging.warning(
                     "Inverter names or device classes not available for day sum processing"
@@ -791,11 +581,11 @@ class DataProcessor:
                 self.publish("SelfCons/selfconsratiotoday", dayratio)
                 self.last_selfcons_yesterday_fallback = selfcons_today
                 self.last_selfcons_ratio_yesterday_fallback = dayratio
-                if (self.battery_device_present or self.battery_present) and len(
+                if (self.devices.battery_device_present or self.devices.battery_present) and len(
                     entry_today
                 ) >= 5:
-                    if self.battery_device_present and self.battery_index:
-                        battery_inv_name = self.inverter_names[self.battery_index[0]]
+                    if self.devices.battery_device_present and self.devices.battery_index:
+                        battery_inv_name = self.devices.inverter_names[self.devices.battery_index[0]]
                         self.publish(
                             f"INV/{battery_inv_name}/BattSelfCons", int(entry_today[2])
                         )
@@ -840,7 +630,7 @@ class DataProcessor:
     async def process_periodic_poll(self, data: dict[str, Any]) -> None:
         """Process periodic poll payload (777/778/801/170 + switch groups elsewhere)."""
         logging.debug("Polling data keys: %s", list(data.keys()))
-        if "777" in data and "0" in data["777"] and self.inverter_names:
+        if "777" in data and "0" in data["777"] and self.devices.inverter_names:
             await self.process_inverter_day_sums(data["777"]["0"])
         if "778" in data and "0" in data["778"]:
             await self.process_self_consumption(data["778"]["0"])
@@ -849,17 +639,6 @@ class DataProcessor:
         if isinstance(block_801, dict):
             json_data = block_801.get("170", block_801.get(170))
         if json_data is not None:
-
-            # Helper to read numeric or string keys transparently
-            def jget(k: int, default: int | str = 0):
-                if isinstance(json_data, dict):
-                    return json_data.get(k, json_data.get(str(k), default))
-                if isinstance(json_data, (list, tuple)):
-                    try:
-                        return json_data[k]
-                    except Exception:
-                        return default
-                return default
 
             # Diagnostic: unknown keys in 801/170
             if isinstance(json_data, dict):
@@ -879,10 +658,10 @@ class DataProcessor:
                 if missing:
                     logging.debug("801/170 missing expected keys: %s", sorted(missing))
 
-            pac_val = int(jget(101, 0))
-            pdc_val = int(jget(102, 0))
-            uac_val = int(jget(103, 0))
-            udc_val = int(jget(104, 0))
+            pac_val = int(safe_get(json_data, 101, 0))
+            pdc_val = int(safe_get(json_data, 102, 0))
+            uac_val = int(safe_get(json_data, 103, 0))
+            udc_val = int(safe_get(json_data, 104, 0))
             logging.debug(
                 "801/170 periodic: pac=%s pdc=%s uac=%s udc=%s",
                 pac_val,
@@ -899,144 +678,26 @@ class DataProcessor:
                 self.publish("status/uac", uac_val)
             if udc_val > 0:
                 self.publish("status/udc", udc_val)
-            self.publish("status/conspac", int(jget(110, 0)))
-            self.last_yield_day = int(jget(105, 0))
-            self.last_yield_yesterday = int(jget(106, 0))
+            self.publish("status/conspac", int(safe_get(json_data, 110, 0)))
+            self.last_yield_day = int(safe_get(json_data, 105, 0))
+            self.last_yield_yesterday = int(safe_get(json_data, 106, 0))
             self.publish("status/yieldday", self.last_yield_day)
             self.publish("status/yieldyesterday", self.last_yield_yesterday)
-            self.publish("status/yieldmonth", int(jget(107, 0)))
-            self.publish("status/yieldyear", int(jget(108, 0)))
-            self.publish("status/yieldtotal", int(jget(109, 0)))
-            self.publish("status/consyieldday", int(jget(111, 0)))
-            self.publish("status/consyieldyesterday", int(jget(112, 0)))
-            self.publish("status/consyieldmonth", int(jget(113, 0)))
-            self.publish("status/consyieldyear", int(jget(114, 0)))
-            self.publish("status/consyieldtotal", int(jget(115, 0)))
-            self.publish("info/lastSync", str(jget(100, "")))
+            self.publish("status/yieldmonth", int(safe_get(json_data, 107, 0)))
+            self.publish("status/yieldyear", int(safe_get(json_data, 108, 0)))
+            self.publish("status/yieldtotal", int(safe_get(json_data, 109, 0)))
+            self.publish("status/consyieldday", int(safe_get(json_data, 111, 0)))
+            self.publish("status/consyieldyesterday", int(safe_get(json_data, 112, 0)))
+            self.publish("status/consyieldmonth", int(safe_get(json_data, 113, 0)))
+            self.publish("status/consyieldyear", int(safe_get(json_data, 114, 0)))
+            self.publish("status/consyieldtotal", int(safe_get(json_data, 115, 0)))
+            self.publish("info/lastSync", str(safe_get(json_data, 100, "")))
             # Track total power for forecast helper
             try:
-                self.total_power_w = int(jget(116, 0))
+                self.total_power_w = int(safe_get(json_data, 116, 0))
             except Exception:
                 self.total_power_w = 0
             self.publish("info/totalPower", self.total_power_w)
         # Dispatch 447 switch group details if present
         if "447" in data:
             await self.process_switch_group_details(data["447"])
-
-    # -------- Historic parsing --------
-
-    def _publish_period_entries(self, entries: list[Any], period: str) -> None:
-        """Publish yield/cons/selfcons for each entry. period is 'monthly' or 'yearly'."""
-        for entry in entries:
-            if len(entry) >= 4 and entry[1]:
-                date_str = entry[0]
-                year = date_str[-2:]
-                if period == "monthly":
-                    month = date_str[3:5]
-                    self.publish(f"Historic/20{year}/monthly/{month}/yieldmonth", entry[1])
-                    self.publish(f"Historic/20{year}/monthly/{month}/consmonth", entry[2])
-                    self.publish(f"Historic/20{year}/monthly/{month}/selfconsmonth", entry[3])
-                else:
-                    self.publish(f"Historic/20{year}/yieldyear", entry[1])
-                    self.publish(f"Historic/20{year}/consyear", entry[2])
-                    self.publish(f"Historic/20{year}/selfconsyear", entry[3])
-
-    def _publish_selfcons_pair(
-        self,
-        current_entry: list[Any],
-        last_entry: list[Any],
-        current_topic: str,
-        ratio_topic: str,
-        last_topic: str,
-        last_ratio_topic: str,
-    ) -> None:
-        """Publish selfcons value + ratio for a current/last period pair."""
-        if len(current_entry) >= 4:
-            self.publish(current_topic, int(current_entry[3]))
-            cons = current_entry[2] or 0
-            if cons > 0:
-                self.publish(ratio_topic, self._selfcons_ratio_kwh(current_entry[3], cons))
-        if len(last_entry) >= 4:
-            self.publish(last_topic, int(last_entry[3]))
-            cons_last = last_entry[2] or 0
-            if cons_last > 0:
-                self.publish(last_ratio_topic, self._selfcons_ratio_kwh(last_entry[3], cons_last))
-
-    async def process_historic_response(
-        self, req_data: str, data: dict[str, Any]
-    ) -> None:
-        """Process 854/877/878 historic payloads from /getjp API."""
-        try:
-            logging.debug("Historic data response keys: %s", list(data.keys()))
-            # 854: per-inverter yearly data
-            if "854" in data:
-                data_year = data["854"]
-                logging.debug(
-                    "Processing yearly data (854): %s entries", len(data_year)
-                )
-                for entry in data_year:
-                    if len(entry) >= 2 and entry[1]:
-                        year = entry[0][-2:]
-                        inverter_data = entry[1]
-                        for inu, inverter_name in enumerate(self.inverter_names):
-                            if inu < len(inverter_data) and inverter_data[inu]:
-                                self.publish(
-                                    f"Historic/20{year}/yieldyearINV/{inverter_name}",
-                                    inverter_data[inu],
-                                )
-            # 877: monthly totals and self-cons metrics
-            if "877" in data:
-                data_month_tot = data["877"]
-                logging.debug(
-                    "Processing monthly totals (877): %s entries", len(data_month_tot)
-                )
-                if len(data_month_tot) >= 2:
-                    self._publish_selfcons_pair(
-                        data_month_tot[-1], data_month_tot[-2],
-                        "SelfCons/selfconsmonth", "SelfCons/selfconsratiomonth",
-                        "SelfCons/selfconslastmonth", "SelfCons/selfconsratiolastmonth",
-                    )
-                self._publish_period_entries(data_month_tot, "monthly")
-            # 878: yearly totals and self-cons metrics
-            if "878" in data:
-                data_year_tot = data["878"]
-                logging.debug(
-                    "Processing yearly totals (878): %s entries", len(data_year_tot)
-                )
-                if len(data_year_tot) >= 2:
-                    self._publish_selfcons_pair(
-                        data_year_tot[-1], data_year_tot[-2],
-                        "SelfCons/selfconsyear", "SelfCons/selfconsratioyear",
-                        "SelfCons/selfconslastyear", "SelfCons/selfconsratiolastyear",
-                    )
-                self._publish_period_entries(data_year_tot, "yearly")
-        except Exception:
-            logging.exception("Historic data processing error")
-
-    async def process_months_json(self, data: list[Any]) -> None:
-        """Process /months.json payload for monthly historic and ratios."""
-        try:
-            logging.debug("Processing monthly JSON data: %s entries", len(data))
-            self._publish_period_entries(data, "monthly")
-            if len(data) >= 2:
-                self._publish_selfcons_pair(
-                    data[0], data[1],
-                    "SelfCons/selfconsmonth", "SelfCons/selfconsratiomonth",
-                    "SelfCons/selfconslastmonth", "SelfCons/selfconsratiolastmonth",
-                )
-        except Exception:
-            logging.exception("Monthly JSON data processing error")
-
-    async def process_years_json(self, data: list[Any]) -> None:
-        """Process /years.json payload for yearly historic and ratios."""
-        try:
-            logging.debug("Processing yearly JSON data: %s entries", len(data))
-            self._publish_period_entries(data, "yearly")
-            if len(data) >= 2:
-                self._publish_selfcons_pair(
-                    data[0], data[1],
-                    "SelfCons/selfconsyear", "SelfCons/selfconsratioyear",
-                    "SelfCons/selfconslastyear", "SelfCons/selfconsratiolastyear",
-                )
-        except Exception:
-            logging.exception("Yearly JSON data processing error")

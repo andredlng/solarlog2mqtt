@@ -7,8 +7,25 @@ what to do when data is missing or malformed.
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any, Iterable, Protocol
 import logging
+
+
+class PublishFn(Protocol):
+    def __call__(self, topic: str, value: int | float | bool | str) -> None: ...
+
+
+def safe_get(container: Any, key: Any, default: Any = None) -> Any:
+    """Type-agnostic indexed access for list, dict (int or str key), or None."""
+    if container is None:
+        return default
+    if isinstance(container, list):
+        return container[key] if 0 <= key < len(container) else default
+    if isinstance(container, dict):
+        if key in container:
+            return container[key]
+        return container.get(str(key), default)
+    return default
 
 
 def as_dict(val: Any, *, ctx: str = "") -> dict[str, Any] | None:
